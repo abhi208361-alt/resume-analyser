@@ -1,18 +1,69 @@
 @import "tailwindcss";
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap");
 
 @theme {
-  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
-  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+:root {
+  --bg: #f3f4f8;
+  --panel: #ffffff;
+  --panel-soft: #f8f9fc;
+  --border: #e9edf3;
+  --muted: #7a8598;
+  --muted-strong: #5f6d82;
+  --text: #1f2937;
+  --primary: #5a4ae3;
+  --primary-soft: #f2ebff;
+  --success: #1f8d68;
+  --warning: #a86700;
+  --danger: #c6405d;
 }
 
 @layer base {
+  * {
+    box-sizing: border-box;
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
   body {
-    @apply bg-zinc-50 text-zinc-900 font-sans antialiased;
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  button,
+  input,
+  select,
+  textarea {
+    font: inherit;
   }
 }
 
-.glass-card {
-  @apply bg-white/80 backdrop-blur-md border border-zinc-200 shadow-sm rounded-2xl;
-}
+@layer components {
+  .panel {
+    @apply rounded-2xl border border-[#eaedf2] bg-white shadow-[0_1px_0_rgba(15,23,42,0.02)];
+  }
 
+  .soft-panel {
+    @apply rounded-2xl border border-[#eef1f4] bg-[#f8f9fc];
+  }
+
+  .metric-card {
+    @apply rounded-2xl border border-[#eaedf2] bg-white p-4 shadow-[0_1px_0_rgba(15,23,42,0.02)];
+  }
+
+  .sidebar-button {
+    @apply flex w-full items-center justify-between rounded-xl px-3 py-2.5 text-left text-sm transition-colors;
+  }
+
+  .table-shell {
+    @apply overflow-hidden rounded-2xl border border-[#eaedf2] bg-white;
+  }
+}

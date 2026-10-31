@@ -1,24 +1,31 @@
-<<<<<<< HEAD
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://ai.google.dev/static/site-assets/images/share-ais-513315318.png" />
-</div>
+# TalentLens
 
-# Run and deploy your AI Studio app
+AI-powered resume screening and recruitment analytics interface.
 
-This contains everything you need to run your app locally.
+## Features
+- Landing page
+- Dashboard with KPI cards, screening table, AI model health, charts
+- Jobs, Candidates, Resumes, Screenings, Models, Alerts, Reports, Settings
+- Resume upload with PDF/TXT support
+- AI analysis using Gemini when API key is provided
+- Responsive sidebar navigation and mobile drawer
 
-View your app in AI Studio: https://ai.studio/apps/fe075fea-622c-4a3b-9bb9-fc89d426a16c
-
-## Run Locally
-
-**Prerequisites:**  Node.js
-
-
+## Local setup
 1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
-=======
-# resume-analyser
->>>>>>> 83e69701ae77a2451fb0ed9a36c5edd6d71416f6
+   npm install
+
+2. Create a `.env` file:
+   cp .env.example .env
+
+3. Add your Gemini API key if you want live AI scoring:
+   VITE_GEMINI_API_KEY=your_key_here
+
+4. Start the app:
+   npm run dev
+
+5. Open:
+   http://localhost:3000
+
+## Login
+- Email: admin@talentlens.ai
+- Password: admin123
