@@ -4,485 +4,295 @@ import dotenv from "dotenv";
 import multer from "multer";
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import pdfParse from "pdf-parse";
-import jwt from "jsonwebtoken";
+import mammoth from "mammoth";
+import bcrypt from "bcryptjs";
 import { db } from "./db.js";
+import { analyzeResume } from "./gemini.js";
+import { signToken, verifyToken } from "./auth.js";
 
 dotenv.config();
 
 const app = express();
 const PORT = Number(process.env.PORT || 4000);
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-const JWT_SECRET = process.env.JWT_SECRET || "talentlens_secret_key_2025";
-
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const uploadsDir = path.join(__dirname, "uploads");
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
-}
+fs.mkdirSync(uploadsDir, { recursive: true });
+
+app.use(cors({ origin: process.env.FRONTEND_URL || "http://localhost:3000", credentials: true }));
+app.use(express.json({ limit: "1mb" }));
 
 const upload = multer({
-  dest: uploadsDir,
-  limits: { fileSize: 10 * 1024 * 1024 },
+  storage: multer.diskStorage({
+    destination: uploadsDir,
+    filename: (_req, file, cb) => cb(null, `${crypto.randomUUID()}${path.extname(file.originalname).toLowerCase()}`),
+  }),
+  limits: { fileSize: Number(process.env.MAX_UPLOAD_BYTES || 10 * 1024 * 1024) },
   fileFilter: (_req, file, cb) => {
-    const allowed = ["application/pdf", "text/plain"];
-    if (allowed.includes(file.mimetype)) cb(null, true);
-    else cb(new Error("Only PDF and TXT files are supported"));
+    const allowed = new Set([
+      "application/pdf",
+      "text/plain",
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ]);
+    cb(allowed.has(file.mimetype) ? null : new Error("Only PDF, DOCX, and TXT files are supported"), allowed.has(file.mimetype));
   },
 });
 
-app.use(
-  cors({
-    origin: process.env.FRONTEND_URL || "http://localhost:3000",
-    credentials: true,
-  })
-);
-app.use(express.json());
+const audit = (userId, action, detail = "") =>
+  db.prepare("INSERT INTO audit_logs (user_id, action, detail) VALUES (?, ?, ?)").run(userId, action, detail);
 
-function signToken(user) {
-  return jwt.sign(
-    {
-      id: user.id,
-      email: user.email,
-      name: user.name,
-      role: user.role,
-    },
-    JWT_SECRET,
-    { expiresIn: "12h" }
-  );
+function userId(req) {
+  return Number(req.user.id);
 }
 
-function verifyToken(req, res, next) {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    return res.status(401).json({ message: "Unauthorized" });
-  }
-  const token = authHeader.split(" ")[1];
+function own(table, id, owner) {
+  return db.prepare(`SELECT * FROM ${table} WHERE id = ? AND user_id = ?`).get(id, owner);
+}
+
+async function extractText(file) {
+  if (file.mimetype === "application/pdf") return (await pdfParse(fs.readFileSync(file.path))).text;
+  if (file.mimetype.includes("wordprocessingml")) return (await mammoth.extractRawText({ path: file.path })).value;
+  return fs.readFileSync(file.path, "utf8");
+}
+
+function safeUser(user) {
+  return { id: user.id, name: user.name, email: user.email, role: user.role };
+}
+
+app.get("/api/health", (_req, res) => res.json({ status: "ok", database: "sqlite", ai: Boolean(process.env.GEMINI_API_KEY) }));
+
+app.post("/api/register", async (req, res, next) => {
   try {
-    req.user = jwt.verify(token, JWT_SECRET);
-    next();
-  } catch (error) {
-    return res.status(401).json({ message: "Invalid token" });
-  }
-}
-
-function fallbackAnalysis() {
-  return {
-    score: 86,
-    summary:
-      "Candidate demonstrates strong role alignment and clear communication of relevant work. The profile is a strong match with a few gaps around measurable business impact and job-specific keywords.",
-    strengths: [
-      "Strong product and UX awareness",
-      "Relevant experience with technical delivery",
-      "Good cross-functional communication",
-    ],
-    weaknesses: [
-      "Could include more measurable business impact",
-      "Need stronger evidence of role-specific keywords",
-      "Add examples of direct stakeholder influence",
-    ],
-    suggestions: [
-      "Add more quantified results to project descriptions",
-      "Promote direct product metrics and stakeholder influence",
-      "Mirror role-specific keyword clusters in the resume",
-    ],
-    keywordMatch: {
-      found: ["product", "design", "analysis", "ux", "research"],
-      missing: ["A/B testing", "roadmapping", "stakeholder management"],
-    },
-  };
-}
-
-async function analyzeTextWithGemini(resumeText, jobDescription) {
-  const apiKey = process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY;
-
-  if (!apiKey) {
-    return fallbackAnalysis();
-  }
-
-  try {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [
-            {
-              parts: [
-                {
-                  text: `
-                    Analyze this resume against the job description.
-                    Return valid JSON only in this shape:
-                    {
-                      "score": 0-100,
-                      "summary": "string",
-                      "strengths": ["string"],
-                      "weaknesses": ["string"],
-                      "suggestions": ["string"],
-                      "keywordMatch": {
-                        "found": ["string"],
-                        "missing": ["string"]
-                      }
-                    }
-
-                    Job description:
-                    ${jobDescription}
-
-                    Resume:
-                    ${resumeText}
-                  `,
-                },
-              ],
-            },
-          ],
-        }),
-      }
-    );
-
-    if (!response.ok) {
-      throw new Error("Gemini unavailable");
+    const { name, email, password } = req.body || {};
+    if (!name?.trim() || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email || "") || String(password || "").length < 8) {
+      return res.status(400).json({ message: "Name, valid email, and a password of at least 8 characters are required" });
     }
-
-    const data = await response.json();
-    const text =
-      data?.candidates?.[0]?.content?.parts?.[0]?.text ||
-      JSON.stringify(fallbackAnalysis());
-
-    const parsed = JSON.parse(text);
-
-    return {
-      score: Number(parsed.score ?? 86),
-      summary: String(parsed.summary ?? fallbackAnalysis().summary),
-      strengths: Array.isArray(parsed.strengths)
-        ? parsed.strengths
-        : fallbackAnalysis().strengths,
-      weaknesses: Array.isArray(parsed.weaknesses)
-        ? parsed.weaknesses
-        : fallbackAnalysis().weaknesses,
-      suggestions: Array.isArray(parsed.suggestions)
-        ? parsed.suggestions
-        : fallbackAnalysis().suggestions,
-      keywordMatch: {
-        found: Array.isArray(parsed.keywordMatch?.found)
-          ? parsed.keywordMatch.found
-          : fallbackAnalysis().keywordMatch.found,
-        missing: Array.isArray(parsed.keywordMatch?.missing)
-          ? parsed.keywordMatch.missing
-          : fallbackAnalysis().keywordMatch.missing,
-      },
-    };
+    const normalizedEmail = email.trim().toLowerCase();
+    if (db.prepare("SELECT id FROM users WHERE email = ?").get(normalizedEmail)) {
+      return res.status(409).json({ message: "An account with that email already exists" });
+    }
+    const result = db.prepare("INSERT INTO users (name, email, password, role) VALUES (?, ?, ?, 'user')")
+      .run(name.trim(), normalizedEmail, await bcrypt.hash(password, 12));
+    const user = db.prepare("SELECT * FROM users WHERE id = ?").get(result.lastInsertRowid);
+    audit(user.id, "register");
+    res.status(201).json({ token: signToken(user), user: safeUser(user) });
   } catch (error) {
-    return fallbackAnalysis();
+    next(error);
   }
-}
-
-// AUTH
-app.post("/api/login", (req, res) => {
-  const { email, password } = req.body || {};
-  const user = db
-    .prepare("SELECT * FROM users WHERE email = ? AND password = ?")
-    .get(email, password);
-
-  if (!user) {
-    return res.status(401).json({ message: "Invalid email or password" });
-  }
-
-  return res.json({
-    token: signToken(user),
-    user: {
-      id: user.id,
-      name: user.name,
-      email: user.email,
-      role: user.role,
-    },
-  });
 });
 
-app.get("/api/health", (_req, res) => {
-  res.json({ status: "ok" });
+app.post("/api/login", async (req, res, next) => {
+  try {
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const user = db.prepare("SELECT * FROM users WHERE email = ?").get(email);
+    if (!user || !(await bcrypt.compare(String(req.body?.password || ""), user.password))) {
+      return res.status(401).json({ message: "Invalid email or password" });
+    }
+    audit(user.id, "login");
+    res.json({ token: signToken(user), user: safeUser(user) });
+  } catch (error) {
+    next(error);
+  }
 });
 
-// DASHBOARD
-app.get("/api/dashboard", verifyToken, (_req, res) => {
-  const jobs = db.prepare("SELECT * FROM jobs ORDER BY id DESC").all();
-  const screenings = db.prepare("SELECT * FROM screenings ORDER BY id DESC LIMIT 5").all();
+app.post("/api/logout", verifyToken, (req, res) => {
+  audit(userId(req), "logout");
+  res.json({ success: true });
+});
 
+app.get("/api/me", verifyToken, (req, res) => {
+  const user = db.prepare("SELECT id, name, email, role, created_at FROM users WHERE id = ?").get(userId(req));
+  if (!user) return res.status(404).json({ message: "User not found" });
+  res.json(user);
+});
+
+app.get("/api/dashboard", verifyToken, (req, res) => {
+  const id = userId(req);
+  const totalResumes = db.prepare("SELECT COUNT(*) count FROM resumes WHERE user_id = ?").get(id).count;
+  const totalAnalyses = db.prepare("SELECT COUNT(*) count FROM analyses WHERE user_id = ?").get(id).count;
+  const average = db.prepare("SELECT COALESCE(ROUND(AVG(score)), 0) score FROM analyses WHERE user_id = ?").get(id).score;
+  const recent = db.prepare(`
+    SELECT a.id, COALESCE(r.candidate_name, 'Resume') name, COALESCE(a.job_title, 'General analysis') role,
+      a.score, a.created_at updated, a.source
+    FROM analyses a LEFT JOIN resumes r ON r.id = a.resume_id
+    WHERE a.user_id = ? ORDER BY a.id DESC LIMIT 8
+  `).all(id);
+  const skills = db.prepare("SELECT result_json FROM analyses WHERE user_id = ? ORDER BY id DESC LIMIT 20").all(id)
+    .flatMap((row) => JSON.parse(row.result_json).extracted?.skills ? Object.values(JSON.parse(row.result_json).extracted.skills).flat() : []);
+  const counts = [...new Set(skills)].map((skill) => ({ label: skill, value: skills.filter((item) => item === skill).length, color: "#5b4ae3" }));
   res.json({
     metrics: [
-      { label: "New Resumes Today", value: 184, delta: "+12%" },
-      { label: "Auto-Screened", value: 96, delta: "+8%" },
-      { label: "Awaiting Review", value: 31, delta: "-5%" },
-      { label: "Active Jobs", value: jobs.length, delta: "+2" },
+      { label: "Total Resumes", value: totalResumes, delta: "persisted" },
+      { label: "Analyses", value: totalAnalyses, delta: "persisted" },
+      { label: "Average Score", value: average, delta: "out of 100" },
+      { label: "Active Jobs", value: db.prepare("SELECT COUNT(*) count FROM jobs WHERE user_id = ? AND status != 'Closed'").get(id).count, delta: "persisted" },
     ],
-    screenings: screenings.map((row) => ({
-      id: row.id,
-      name: row.candidate_name,
-      role: row.role_name,
-      score: row.score,
-      status: row.status,
-      updated: row.updated,
-    })),
-    applicationsByJob: [
-      { label: "Product", value: 42, color: "#5b4ae3" },
-      { label: "Engineering", value: 31, color: "#7c6ff2" },
-      { label: "Sales", value: 28, color: "#3ac6af" },
-      { label: "Finance", value: 23, color: "#5eaaf6" },
-      { label: "Marketing", value: 37, color: "#8b5cf6" },
-    ],
+    screenings: recent.map((row) => ({ id: row.id, name: row.name, role: row.role, score: row.score, status: row.score >= 75 ? "Strong Match" : "In Review", updated: row.updated })),
+    applicationsByJob: counts.slice(0, 6),
     pipelineStages: [
-      { label: "New", value: 126, color: "#8b5cf6" },
-      { label: "Screening", value: 68, color: "#22c55e" },
-      { label: "Interview", value: 34, color: "#14b8a6" },
-      { label: "Offer", value: 12, color: "#f59e0b" },
-      { label: "Rejected", value: 51, color: "#cbd5e1" },
+      { label: "Analyzed", value: totalAnalyses, color: "#8b5cf6" },
+      { label: "Strong Match", value: recent.filter((row) => row.score >= 75).length, color: "#22c55e" },
+      { label: "Needs Review", value: recent.filter((row) => row.score < 75).length, color: "#f59e0b" },
     ],
   });
 });
 
-// JOBS CRUD
-app.get("/api/jobs", verifyToken, (_req, res) => {
-  const jobs = db.prepare("SELECT * FROM jobs ORDER BY id DESC").all();
-  res.json(jobs);
-});
-
-app.post("/api/jobs", verifyToken, (req, res) => {
-  const { title, department, status, applicants, description, requirements } = req.body || {};
-  if (!title || !department) {
-    return res.status(400).json({ message: "Title and department are required" });
-  }
-
-  const result = db
-    .prepare(`
-      INSERT INTO jobs (title, department, status, applicants, description, requirements)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `)
-    .run(
-      title,
-      department,
-      status || "Open",
-      Number(applicants || 0),
-      description || "",
-      requirements || ""
-    );
-
-  const job = db.prepare("SELECT * FROM jobs WHERE id = ?").get(result.lastInsertRowid);
-  return res.status(201).json(job);
-});
-
-app.put("/api/jobs/:id", verifyToken, (req, res) => {
-  const { id } = req.params;
-  const { title, department, status, applicants, description, requirements } = req.body || {};
-
-  const existing = db.prepare("SELECT * FROM jobs WHERE id = ?").get(id);
-  if (!existing) return res.status(404).json({ message: "Job not found" });
-
-  db.prepare(`
-    UPDATE jobs
-    SET title = ?, department = ?, status = ?, applicants = ?, description = ?, requirements = ?
-    WHERE id = ?
-  `).run(
-    title || existing.title,
-    department || existing.department,
-    status || existing.status,
-    Number(applicants ?? existing.applicants),
-    description ?? existing.description,
-    requirements ?? existing.requirements,
-    id
-  );
-
-  const updated = db.prepare("SELECT * FROM jobs WHERE id = ?").get(id);
-  return res.json(updated);
-});
-
-app.delete("/api/jobs/:id", verifyToken, (req, res) => {
-  const { id } = req.params;
-  const existing = db.prepare("SELECT * FROM jobs WHERE id = ?").get(id);
-  if (!existing) return res.status(404).json({ message: "Job not found" });
-
-  db.prepare("DELETE FROM jobs WHERE id = ?").run(id);
-  return res.json({ success: true });
-});
-
-// CANDIDATES CRUD
-app.get("/api/candidates", verifyToken, (_req, res) => {
-  const rows = db.prepare("SELECT * FROM candidates ORDER BY id DESC").all();
-  res.json(rows);
-});
-
-app.post("/api/candidates", verifyToken, (req, res) => {
-  const { name, email, job_title, status, score, skills } = req.body || {};
-  if (!name || !email) {
-    return res.status(400).json({ message: "Name and email are required" });
-  }
-
-  const result = db
-    .prepare(`
-      INSERT INTO candidates (name, email, job_title, status, score, skills)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `)
-    .run(name, email, job_title || "", status || "In Review", Number(score || 0), skills || "");
-
-  const candidate = db.prepare("SELECT * FROM candidates WHERE id = ?").get(result.lastInsertRowid);
-  return res.status(201).json(candidate);
-});
-
-app.put("/api/candidates/:id", verifyToken, (req, res) => {
-  const { id } = req.params;
-  const { name, email, job_title, status, score, skills } = req.body || {};
-
-  const existing = db.prepare("SELECT * FROM candidates WHERE id = ?").get(id);
-  if (!existing) return res.status(404).json({ message: "Candidate not found" });
-
-  db.prepare(`
-    UPDATE candidates
-    SET name = ?, email = ?, job_title = ?, status = ?, score = ?, skills = ?
-    WHERE id = ?
-  `).run(
-    name || existing.name,
-    email || existing.email,
-    job_title ?? existing.job_title,
-    status || existing.status,
-    Number(score ?? existing.score),
-    skills ?? existing.skills,
-    id
-  );
-
-  const updated = db.prepare("SELECT * FROM candidates WHERE id = ?").get(id);
-  return res.json(updated);
-});
-
-app.delete("/api/candidates/:id", verifyToken, (req, res) => {
-  const { id } = req.params;
-  const existing = db.prepare("SELECT * FROM candidates WHERE id = ?").get(id);
-  if (!existing) return res.status(404).json({ message: "Candidate not found" });
-
-  db.prepare("DELETE FROM candidates WHERE id = ?").run(id);
-  return res.json({ success: true });
-});
-
-// SCREENINGS
-app.get("/api/screenings", verifyToken, (_req, res) => {
-  const rows = db.prepare("SELECT * FROM screenings ORDER BY id DESC").all();
-  res.json(
-    rows.map((row) => ({
-      id: row.id,
-      name: row.candidate_name,
-      role: row.role_name,
-      score: row.score,
-      status: row.status,
-      updated: row.updated,
-    }))
-  );
-});
-
-// MODELS
-app.get("/api/models", verifyToken, (_req, res) => {
-  res.json([
-    { id: 1, name: "Resume parsing / extraction", status: "Healthy", detail: "Avg latency 1.1s" },
-    { id: 2, name: "AI scoring / analysis", status: "Degraded", detail: "3 recent spikes" },
-    { id: 3, name: "Skills extraction", status: "Healthy", detail: "92% confidence" },
-    { id: 4, name: "Duplicate detection", status: "Not Configured", detail: "Disabled in tenant" },
-  ]);
-});
-
-// ALERTS
-app.get("/api/alerts", verifyToken, (_req, res) => {
-  const rows = db.prepare("SELECT * FROM alerts ORDER BY id DESC").all();
-  res.json(rows);
-});
-
-// REPORTS
-app.get("/api/reports", verifyToken, (_req, res) => {
-  res.json({
-    cards: [
-      { label: "Avg Match Score", value: "84%", delta: "+4.6%" },
-      { label: "Time to Screen", value: "2.4d", delta: "-12%" },
-      { label: "Offer Rate", value: "31%", delta: "+2.1%" },
-      { label: "Hidden Talent", value: "14%", delta: "+6%" },
-    ],
-    velocity: [42, 58, 76, 63, 85, 92, 74],
-  });
-});
-
-// RESUMES
-app.get("/api/resumes", verifyToken, (_req, res) => {
-  const rows = db.prepare("SELECT * FROM resumes ORDER BY id DESC").all();
-  res.json(
-    rows.map((row) => ({
-      id: row.id,
-      name: row.candidate_name,
-      file: row.file_name,
-      uploaded: row.uploaded_at,
-      status: row.status,
-      score: row.score,
-    }))
-  );
-});
-
-app.post("/api/analyze", verifyToken, async (req, res) => {
-  const { resumeText, jobDescription } = req.body || {};
-  if (!resumeText || !jobDescription) {
-    return res.status(400).json({ message: "resumeText and jobDescription are required" });
-  }
-
-  const result = await analyzeTextWithGemini(resumeText, jobDescription);
-  return res.json(result);
-});
-
-app.post("/api/upload-resume", verifyToken, upload.single("file"), async (req, res) => {
+app.get("/api/jobs", verifyToken, (req, res) => res.json(db.prepare("SELECT * FROM jobs WHERE user_id = ? ORDER BY id DESC").all(userId(req))));
+app.post("/api/jobs", verifyToken, (req, res, next) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ message: "No file uploaded" });
-    }
-
-    let resumeText = "";
-
-    if (req.file.mimetype === "application/pdf") {
-      const buffer = fs.readFileSync(req.file.path);
-      const pdfData = await pdfParse(buffer);
-      resumeText = pdfData.text;
-    } else {
-      resumeText = fs.readFileSync(req.file.path, "utf8");
-    }
-
-    const analysis = await analyzeTextWithGemini(resumeText, "General product and hiring role");
-
-    const candidateName = req.body.candidateName || "Uploaded Candidate";
-    const uploadedAt = new Date().toISOString().slice(0, 10);
-
-    db.prepare(`
-      INSERT INTO resumes (candidate_name, file_name, original_name, stored_path, uploaded_at, status, score)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      candidateName,
-      req.file.originalname,
-      req.file.originalname,
-      req.file.path,
-      uploadedAt,
-      "Analyzed",
-      analysis.score || 82
-    );
-
-    db.prepare(`
-      INSERT INTO screenings (candidate_name, role_name, score, status, updated)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(candidateName, "Frontend Developer", analysis.score || 82, "Strong Match", "just now");
-
-    return res.json({
-      message: "Resume uploaded successfully",
-      score: analysis.score || 82,
-      summary: analysis.summary || "Resume analyzed successfully",
-    });
-  } catch (error) {
-    console.error(error);
-    return res.status(500).json({ message: "Resume processing failed" });
-  }
+    const { title, department, status = "Open", applicants = 0, description = "", requirements = "" } = req.body || {};
+    if (!title?.trim() || !department?.trim()) return res.status(400).json({ message: "Title and department are required" });
+    const result = db.prepare("INSERT INTO jobs (title, department, status, applicants, description, requirements, user_id) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      .run(title.trim(), department.trim(), status, Number(applicants) || 0, description, requirements, userId(req));
+    res.status(201).json(own("jobs", result.lastInsertRowid, userId(req)));
+  } catch (error) { next(error); }
+});
+app.put("/api/jobs/:id", verifyToken, (req, res) => {
+  const existing = own("jobs", req.params.id, userId(req));
+  if (!existing) return res.status(404).json({ message: "Job not found" });
+  const body = req.body || {};
+  db.prepare("UPDATE jobs SET title = ?, department = ?, status = ?, applicants = ?, description = ?, requirements = ? WHERE id = ? AND user_id = ?")
+    .run(body.title || existing.title, body.department || existing.department, body.status || existing.status, Number(body.applicants ?? existing.applicants), body.description ?? existing.description, body.requirements ?? existing.requirements, req.params.id, userId(req));
+  res.json(own("jobs", req.params.id, userId(req)));
+});
+app.delete("/api/jobs/:id", verifyToken, (req, res) => {
+  const result = db.prepare("DELETE FROM jobs WHERE id = ? AND user_id = ?").run(req.params.id, userId(req));
+  if (!result.changes) return res.status(404).json({ message: "Job not found" });
+  res.json({ success: true });
 });
 
-app.listen(PORT, () => {
-  console.log(`TalentLens backend running on http://localhost:${PORT}`);
+app.get("/api/candidates", verifyToken, (req, res) => res.json(db.prepare("SELECT * FROM candidates WHERE user_id = ? ORDER BY id DESC").all(userId(req))));
+app.post("/api/candidates", verifyToken, (req, res) => {
+  const { name, email, job_title = "", status = "In Review", score = 0, skills = "" } = req.body || {};
+  if (!name?.trim() || !email?.trim()) return res.status(400).json({ message: "Name and email are required" });
+  const result = db.prepare("INSERT INTO candidates (name, email, job_title, status, score, skills, user_id) VALUES (?, ?, ?, ?, ?, ?, ?)")
+    .run(name.trim(), email.trim(), job_title, status, Number(score) || 0, skills, userId(req));
+  res.status(201).json(own("candidates", result.lastInsertRowid, userId(req)));
 });
+app.put("/api/candidates/:id", verifyToken, (req, res) => {
+  const existing = own("candidates", req.params.id, userId(req));
+  if (!existing) return res.status(404).json({ message: "Candidate not found" });
+  const body = req.body || {};
+  db.prepare("UPDATE candidates SET name = ?, email = ?, job_title = ?, status = ?, score = ?, skills = ? WHERE id = ? AND user_id = ?")
+    .run(body.name || existing.name, body.email || existing.email, body.job_title ?? existing.job_title, body.status || existing.status, Number(body.score ?? existing.score), body.skills ?? existing.skills, req.params.id, userId(req));
+  res.json(own("candidates", req.params.id, userId(req)));
+});
+app.delete("/api/candidates/:id", verifyToken, (req, res) => {
+  const result = db.prepare("DELETE FROM candidates WHERE id = ? AND user_id = ?").run(req.params.id, userId(req));
+  if (!result.changes) return res.status(404).json({ message: "Candidate not found" });
+  res.json({ success: true });
+});
+
+app.get("/api/screenings", verifyToken, (req, res) => res.json(db.prepare("SELECT id, candidate_name name, role_name role, score, status, updated FROM screenings WHERE user_id = ? ORDER BY id DESC").all(userId(req))));
+app.get("/api/models", verifyToken, (_req, res) => res.json([
+  { id: 1, name: "Resume parsing / extraction", status: "Healthy", detail: "PDF, DOCX, and TXT" },
+  { id: 2, name: "AI scoring / analysis", status: process.env.GEMINI_API_KEY ? "Healthy" : "Unavailable", detail: process.env.GEMINI_API_KEY ? "Gemini configured" : "Local analysis active" },
+  { id: 3, name: "Skills extraction", status: "Healthy", detail: "Deterministic local extraction" },
+]));
+app.get("/api/alerts", verifyToken, (_req, res) => res.json(db.prepare("SELECT * FROM alerts ORDER BY id DESC").all()));
+
+app.get("/api/resumes", verifyToken, (req, res) => {
+  const rows = db.prepare("SELECT id, candidate_name name, file_name file, original_name, uploaded_at uploaded, status, score FROM resumes WHERE user_id = ? ORDER BY id DESC").all(userId(req));
+  res.json(rows);
+});
+app.post("/api/upload-resume", verifyToken, upload.single("file"), async (req, res, next) => {
+  try {
+    if (!req.file) return res.status(400).json({ message: "No file uploaded" });
+    const text = await extractText(req.file);
+    if (text.trim().length < 20) return res.status(422).json({ message: "The uploaded file does not contain enough readable text" });
+    const candidateName = String(req.body.candidateName || "").trim() || "Uploaded Candidate";
+    const result = db.prepare("INSERT INTO resumes (candidate_name, file_name, original_name, stored_path, uploaded_at, status, score, user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(candidateName, req.file.filename, req.file.originalname, req.file.path, new Date().toISOString(), "Extracted", 0, userId(req));
+    const resumeId = result.lastInsertRowid;
+    const analysis = await analyzeResume(text, req.body.jobDescription || "General professional role");
+    db.prepare("UPDATE resumes SET status = 'Analyzed', score = ? WHERE id = ? AND user_id = ?").run(analysis.score, resumeId, userId(req));
+    db.prepare("INSERT INTO extracted_resume_data (resume_id, data_json) VALUES (?, ?)").run(resumeId, JSON.stringify(analysis.extracted));
+    db.prepare("INSERT INTO analyses (user_id, resume_id, job_title, job_description, score, ats_score, result_json, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(userId(req), resumeId, req.body.jobTitle || "", req.body.jobDescription || "General professional role", analysis.score, analysis.atsScore, JSON.stringify(analysis), analysis.source);
+    audit(userId(req), "upload_resume", req.file.originalname);
+    res.status(201).json({ resume: own("resumes", resumeId, userId(req)), analysis: { ...analysis, resumeId } });
+  } catch (error) { next(error); }
+});
+app.get("/api/resumes/:id/download", verifyToken, (req, res) => {
+  const resume = own("resumes", req.params.id, userId(req));
+  if (!resume || !fs.existsSync(resume.stored_path)) return res.status(404).json({ message: "Resume not found" });
+  res.download(resume.stored_path, resume.original_name);
+});
+app.delete("/api/resumes/:id", verifyToken, (req, res) => {
+  const resume = own("resumes", req.params.id, userId(req));
+  if (!resume) return res.status(404).json({ message: "Resume not found" });
+  if (fs.existsSync(resume.stored_path)) fs.unlinkSync(resume.stored_path);
+  db.prepare("DELETE FROM resumes WHERE id = ? AND user_id = ?").run(req.params.id, userId(req));
+  res.json({ success: true });
+});
+
+app.post("/api/analyze", verifyToken, async (req, res, next) => {
+  try {
+    if (!req.body?.resumeText?.trim() || !req.body?.jobDescription?.trim()) return res.status(400).json({ message: "resumeText and jobDescription are required" });
+    const analysis = await analyzeResume(req.body.resumeText, req.body.jobDescription);
+    const result = db.prepare("INSERT INTO analyses (user_id, job_title, job_description, score, ats_score, result_json, source) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      .run(userId(req), req.body.jobTitle || "", req.body.jobDescription, analysis.score, analysis.atsScore, JSON.stringify(analysis), analysis.source);
+    audit(userId(req), "analyze_resume");
+    res.json({ ...analysis, analysisId: result.lastInsertRowid });
+  } catch (error) { next(error); }
+});
+app.get("/api/analyses", verifyToken, (req, res) => {
+  const rows = db.prepare("SELECT a.id, a.resume_id resumeId, a.job_title jobTitle, a.score, a.ats_score atsScore, a.source, a.created_at createdAt, a.result_json result FROM analyses a WHERE a.user_id = ? ORDER BY a.id DESC").all(userId(req));
+  res.json(rows.map((row) => ({ ...row, result: JSON.parse(row.result) })));
+});
+app.get("/api/analyses/:id", verifyToken, (req, res) => {
+  const row = db.prepare("SELECT * FROM analyses WHERE id = ? AND user_id = ?").get(req.params.id, userId(req));
+  if (!row) return res.status(404).json({ message: "Analysis not found" });
+  res.json({ ...row, result: JSON.parse(row.result_json) });
+});
+app.delete("/api/analyses/:id", verifyToken, (req, res) => {
+  const result = db.prepare("DELETE FROM analyses WHERE id = ? AND user_id = ?").run(req.params.id, userId(req));
+  if (!result.changes) return res.status(404).json({ message: "Analysis not found" });
+  res.json({ success: true });
+});
+
+app.post("/api/job-matches", verifyToken, async (req, res, next) => {
+  try {
+    const resume = own("resumes", req.body?.resumeId, userId(req));
+    if (!resume) return res.status(404).json({ message: "Resume not found" });
+    const description = String(req.body?.description || "").trim();
+    if (!description) return res.status(400).json({ message: "Job description is required" });
+    const resumeMime = resume.original_name.toLowerCase().endsWith(".pdf")
+      ? "application/pdf"
+      : resume.original_name.toLowerCase().endsWith(".docx")
+        ? "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        : "text/plain";
+    const analysis = await analyzeResume(await extractText({ path: resume.stored_path, mimetype: resumeMime }), description);
+    const job = db.prepare("INSERT INTO job_descriptions (user_id, title, company, description) VALUES (?, ?, ?, ?)")
+      .run(userId(req), req.body.title || "Untitled role", req.body.company || "", description);
+    const match = db.prepare("INSERT INTO job_matches (user_id, resume_id, job_description_id, score, result_json) VALUES (?, ?, ?, ?, ?)")
+      .run(userId(req), resume.id, job.lastInsertRowid, analysis.score, JSON.stringify(analysis));
+    res.status(201).json({ id: match.lastInsertRowid, score: analysis.score, result: analysis });
+  } catch (error) { next(error); }
+});
+
+app.get("/api/reports", verifyToken, (req, res) => {
+  const id = userId(req);
+  const rows = db.prepare("SELECT score, ats_score atsScore, created_at createdAt, result_json result FROM analyses WHERE user_id = ? ORDER BY id DESC").all(id);
+  const average = rows.length ? Math.round(rows.reduce((sum, row) => sum + row.score, 0) / rows.length) : 0;
+  res.json({ cards: [{ label: "Average Resume Score", value: `${average}%`, delta: `${rows.length} analyses` }, { label: "Analyses", value: String(rows.length), delta: "saved" }], analyses: rows.map((row) => ({ ...row, result: JSON.parse(row.result) })) });
+});
+
+app.get("/api/admin/overview", verifyToken, (req, res) => {
+  if (req.user.role !== "admin") return res.status(403).json({ message: "Administrator access required" });
+  res.json({
+    users: db.prepare("SELECT COUNT(*) count FROM users").get().count,
+    resumes: db.prepare("SELECT COUNT(*) count FROM resumes").get().count,
+    analyses: db.prepare("SELECT COUNT(*) count FROM analyses").get().count,
+    auditLogs: db.prepare("SELECT * FROM audit_logs ORDER BY id DESC LIMIT 50").all(),
+  });
+});
+
+app.use((error, _req, res, _next) => {
+  console.error(error);
+  res.status(error.code === "LIMIT_FILE_SIZE" ? 413 : 500).json({ message: error.code === "LIMIT_FILE_SIZE" ? "File exceeds the upload size limit" : error.message || "Internal server error" });
+});
+
+app.listen(PORT, () => console.log(`TalentLens backend running on http://localhost:${PORT}`));

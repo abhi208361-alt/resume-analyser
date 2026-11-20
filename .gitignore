@@ -3,3 +3,6 @@ dist
 .env
 .env.local
 .vite
+backend/uploads/*
+!backend/uploads/.gitkeep
+backend/data/*.db
