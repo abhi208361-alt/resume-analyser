@@ -48,6 +48,7 @@ type PageKey =
   | "Models"
   | "Alerts"
   | "Reports"
+  | "History"
   | "Settings";
 
 type StatusValue =
@@ -72,6 +73,16 @@ type Job = {
   description?: string;
   requirements?: string;
   created_at?: string;
+};
+
+type AnalysisHistory = {
+  id: number;
+  jobTitle: string;
+  score: number;
+  atsScore: number;
+  source: string;
+  createdAt: string;
+  result: AnalysisResult;
 };
 
 type Candidate = {
@@ -118,6 +129,10 @@ type DashboardReadout = {
 
 type AnalysisResult = {
   score: number;
+  atsScore?: number;
+  analysisId?: number;
+  source?: string;
+  warning?: string;
   summary: string;
   strengths: string[];
   weaknesses: string[];
@@ -138,6 +153,7 @@ const sidebarPages: Array<{ key: PageKey; icon: React.ReactNode; label: string }
   { key: "Models", icon: <Sparkles className="h-4 w-4" />, label: "Models" },
   { key: "Alerts", icon: <Bell className="h-4 w-4" />, label: "Alerts" },
   { key: "Reports", icon: <TrendingUp className="h-4 w-4" />, label: "Reports" },
+  { key: "History", icon: <FolderCog className="h-4 w-4" />, label: "Analysis History" },
   { key: "Settings", icon: <Settings className="h-4 w-4" />, label: "Settings" },
 ];
 
@@ -167,6 +183,58 @@ const demoReports = {
 
 function cn(...values: Array<string | false | null | undefined>) {
   return values.filter(Boolean).join(" ");
+}
+
+function HistoryPage({
+  analyses,
+  onDelete,
+}: {
+  analyses: AnalysisHistory[];
+  onDelete: (id: number) => void;
+}) {
+  return (
+    <div className="space-y-6">
+      <div>
+        <h2 className="text-2xl font-semibold text-[#111827]">Analysis History</h2>
+        <p className="text-sm text-[#7a8598]">Persisted resume analysis results</p>
+      </div>
+      <div className="overflow-hidden rounded-2xl border border-[#eaedf2] bg-white">
+        <table className="min-w-full text-left text-sm">
+          <thead className="bg-[#f8f9fc] text-[#7a8598]">
+            <tr>
+              <th className="px-4 py-3 font-medium">Role</th>
+              <th className="px-4 py-3 font-medium">Resume</th>
+              <th className="px-4 py-3 font-medium">Score</th>
+              <th className="px-4 py-3 font-medium">ATS</th>
+              <th className="px-4 py-3 font-medium">Date</th>
+              <th className="px-4 py-3 font-medium">Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {analyses.map((analysis) => (
+              <tr key={analysis.id} className="border-t border-[#eef1f5]">
+                <td className="px-4 py-3 font-medium text-[#1d2430]">{analysis.jobTitle || "General analysis"}</td>
+                <td className="px-4 py-3 text-[#5f6d82]">{analysis.source}</td>
+                <td className="px-4 py-3 font-semibold text-[#1f8d68]">{analysis.score}%</td>
+                <td className="px-4 py-3 text-[#5f6d82]">{analysis.atsScore}%</td>
+                <td className="px-4 py-3 text-[#7a8598]">{new Date(analysis.createdAt).toLocaleString()}</td>
+                <td className="px-4 py-3">
+                  <button
+                    className="rounded-lg border border-[#edf1f5] bg-[#f8f9fc] p-2"
+                    onClick={() => onDelete(analysis.id)}
+                    aria-label="Delete analysis"
+                  >
+                    <Trash2 className="h-3.5 w-3.5 text-[#c6405d]" />
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {!analyses.length && <div className="p-10 text-center text-sm text-[#7a8598]">No analyses saved yet.</div>}
+      </div>
+    </div>
+  );
 }
 
 function apiRequest(path: string, options: RequestInit = {}) {
@@ -801,6 +869,7 @@ function CandidatesPage({
 function ResumesPage() {
   const [resumeText, setResumeText] = useState("");
   const [jobDescription, setJobDescription] = useState("");
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isParsing, setIsParsing] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
@@ -820,15 +889,14 @@ function ResumesPage() {
         text = await extractTextFromPDF(file);
       } else if (file.type === "text/plain") {
         text = await file.text();
-      } else {
-        throw new Error("Unsupported file type. Please upload a PDF or TXT file.");
       }
 
-      if (!text.trim()) {
+      if (text && !text.trim()) {
         throw new Error("Could not extract text from the file.");
       }
 
-      setResumeText(text);
+      setSelectedFile(file);
+      if (text) setResumeText(text);
     } catch (err: any) {
       setError(err?.message || "Failed to read file.");
     } finally {
@@ -838,7 +906,7 @@ function ResumesPage() {
   };
 
   const handleAnalyze = async () => {
-    if (!resumeText || !jobDescription) {
+    if ((!resumeText && !selectedFile) || !jobDescription) {
       setError("Please provide both a resume and a job description.");
       return;
     }
@@ -847,10 +915,20 @@ function ResumesPage() {
     setError(null);
 
     try {
-      const response = await apiRequest("/api/analyze", {
-        method: "POST",
-        body: JSON.stringify({ resumeText, jobDescription }),
-      });
+      let response;
+      if (selectedFile) {
+        const body = new FormData();
+        body.append("file", selectedFile);
+        body.append("candidateName", "Uploaded Candidate");
+        body.append("jobDescription", jobDescription);
+        response = await apiRequest("/api/upload-resume", { method: "POST", body });
+        response = response.analysis;
+      } else {
+        response = await apiRequest("/api/analyze", {
+          method: "POST",
+          body: JSON.stringify({ resumeText, jobDescription }),
+        });
+      }
 
       setResult(response);
     } catch (err) {
@@ -865,6 +943,7 @@ function ResumesPage() {
     setError(null);
     setResumeText("");
     setJobDescription("");
+    setSelectedFile(null);
   };
 
   return (
@@ -878,7 +957,7 @@ function ResumesPage() {
         <label className="inline-flex cursor-pointer items-center gap-2 rounded-xl bg-[#111827] px-3.5 py-2.5 text-sm font-medium text-white">
           <UploadCloud className="h-4 w-4" />
           Upload Resume
-          <input ref={fileInputRef} type="file" accept=".pdf,.txt" className="hidden" onChange={handleUpload} />
+          <input ref={fileInputRef} type="file" accept=".pdf,.docx,.txt" className="hidden" onChange={handleUpload} />
         </label>
       </div>
 
@@ -1142,7 +1221,8 @@ function AlertsPage({ alerts }: { alerts: AlertItem[] }) {
   );
 }
 
-function ReportsPage() {
+function ReportsPage({ reportData }: { reportData: { cards: Array<{ label: string; value: string; delta: string }> } | null }) {
+  const cards = reportData?.cards || [];
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
@@ -1176,7 +1256,7 @@ function ReportsPage() {
       </div>
 
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-        {demoReports.cards.map((card) => (
+        {cards.map((card) => (
           <div key={card.label} className="rounded-2xl border border-[#eaedf2] bg-white p-4 shadow-[0_1px_0_rgba(15,23,42,0.02)]">
             <div className="text-[11px] uppercase tracking-[0.18em] text-[#7a8598]">{card.label}</div>
             <div className="mt-4 flex items-end justify-between">
@@ -1190,7 +1270,7 @@ function ReportsPage() {
       <div className="rounded-2xl border border-[#eaedf2] bg-white p-4 shadow-[0_1px_0_rgba(15,23,42,0.02)]">
         <div className="mb-4 text-lg font-semibold text-[#111827]">Hiring velocity</div>
         <div className="flex h-48 items-end gap-3">
-          {demoReports.velocity.map((value, index) => (
+          {(reportData ? reportData.cards.map((card) => Number.parseInt(card.value, 10) || 0) : []).map((value, index) => (
             <div key={`${value}-${index}`} className="flex flex-1 flex-col items-center gap-2">
               <div
                 className="flex h-full w-full items-end justify-center rounded-t-2xl bg-gradient-to-t from-[#6a5ce7] to-[#7d6ff1]"
@@ -1461,7 +1541,7 @@ function DashboardPage({
 export default function App() {
   const [isLoggedIn, setIsLoggedIn] = useState<boolean>(() => {
     if (typeof window === "undefined") return false;
-    return localStorage.getItem("talentlens-auth") === "true";
+    return Boolean(localStorage.getItem("talentlens-token"));
   });
 
   const [activePage, setActivePage] = useState<PageKey>("Dashboard");
@@ -1470,6 +1550,8 @@ export default function App() {
   const [loginEmail, setLoginEmail] = useState("admin@talentlens.ai");
   const [loginPassword, setLoginPassword] = useState("admin123");
   const [loginError, setLoginError] = useState("");
+  const [authMode, setAuthMode] = useState<"login" | "register">("login");
+  const [registerName, setRegisterName] = useState("");
 
   const [jobs, setJobs] = useState<Job[]>([]);
   const [candidates, setCandidates] = useState<Candidate[]>([]);
@@ -1477,10 +1559,12 @@ export default function App() {
   const [alerts, setAlerts] = useState<AlertItem[]>([]);
   const [models, setModels] = useState<ModelHealth[]>([]);
   const [dashboard, setDashboard] = useState<DashboardReadout | null>(null);
+  const [reportData, setReportData] = useState<{ cards: Array<{ label: string; value: string; delta: string }> } | null>(null);
+  const [analyses, setAnalyses] = useState<AnalysisHistory[]>([]);
 
   const fetchAppData = async () => {
     try {
-      const [dashboardRes, jobsRes, candidatesRes, screeningsRes, alertsRes, modelsRes] =
+      const [dashboardRes, jobsRes, candidatesRes, screeningsRes, alertsRes, modelsRes, reportsRes, analysesRes] =
         await Promise.all([
           apiRequest("/api/dashboard"),
           apiRequest("/api/jobs"),
@@ -1488,6 +1572,8 @@ export default function App() {
           apiRequest("/api/screenings"),
           apiRequest("/api/alerts"),
           apiRequest("/api/models"),
+          apiRequest("/api/reports"),
+          apiRequest("/api/analyses"),
         ]);
 
       setDashboard(dashboardRes);
@@ -1496,6 +1582,8 @@ export default function App() {
       setScreenings(screeningsRes);
       setAlerts(alertsRes);
       setModels(modelsRes);
+      setReportData(reportsRes);
+      setAnalyses(analysesRes);
     } catch (error) {
       console.error("Failed to fetch app data:", error);
     }
@@ -1528,9 +1616,10 @@ export default function App() {
     }
 
     try {
-      const data = await apiRequest("/api/login", {
+      const data = await apiRequest(authMode === "login" ? "/api/login" : "/api/register", {
         method: "POST",
         body: JSON.stringify({
+          ...(authMode === "register" ? { name: registerName } : {}),
           email: loginEmail,
           password: loginPassword,
         }),
@@ -1538,7 +1627,6 @@ export default function App() {
 
       localStorage.setItem("talentlens-token", data.token);
       localStorage.setItem("talentlens-user", JSON.stringify(data.user));
-      localStorage.setItem("talentlens-auth", "true");
       setIsLoggedIn(true);
       setLoginError("");
     } catch (error) {
@@ -1619,6 +1707,15 @@ export default function App() {
     }
   };
 
+  const handleDeleteAnalysis = async (id: number) => {
+    try {
+      await apiRequest(`/api/analyses/${id}`, { method: "DELETE" });
+      setAnalyses((prev) => prev.filter((analysis) => analysis.id !== id));
+    } catch (error) {
+      console.error("Delete analysis failed:", error);
+    }
+  };
+
   const renderPage = () => {
     switch (activePage) {
       case "Landing":
@@ -1645,7 +1742,9 @@ export default function App() {
       case "Alerts":
         return <AlertsPage alerts={alerts} />;
       case "Reports":
-        return <ReportsPage />;
+        return <ReportsPage reportData={reportData} />;
+      case "History":
+        return <HistoryPage analyses={analyses} onDelete={handleDeleteAnalysis} />;
       case "Settings":
         return <SettingsPage />;
       default:
@@ -1672,6 +1771,18 @@ export default function App() {
           </div>
 
           <form onSubmit={handleLogin} className="mt-7 space-y-4">
+          {authMode === "register" && (
+            <label className="block">
+              <div className="mb-2 text-sm font-medium text-[#1f2937]">Name</div>
+              <input
+                type="text"
+                required
+                value={registerName}
+                onChange={(e) => setRegisterName(e.target.value)}
+                className="w-full rounded-xl border border-[#e9edf3] bg-[#f8f9fc] py-2.5 px-3 text-sm outline-none focus:border-[#bcaefb]"
+              />
+            </label>
+          )}
             <label className="block">
               <div className="mb-2 text-sm font-medium text-[#1f2937]">Email</div>
               <div className="relative">
@@ -1707,8 +1818,18 @@ export default function App() {
             <button type="submit" className="w-full rounded-xl bg-[#111827] px-4 py-3 text-sm font-medium text-white">
               <span className="inline-flex items-center gap-2">
                 <LogIn className="h-4 w-4" />
-                Sign in to TalentLens
+                {authMode === "login" ? "Sign in to TalentLens" : "Create TalentLens account"}
               </span>
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setAuthMode((mode) => (mode === "login" ? "register" : "login"));
+                setLoginError("");
+              }}
+              className="w-full text-sm font-medium text-[#5e4bde]"
+            >
+              {authMode === "login" ? "Create an account" : "Already have an account? Sign in"}
             </button>
           </form>
         </motion.div>

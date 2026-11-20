@@ -1,9 +1,10 @@
 import jwt from "jsonwebtoken";
 import dotenv from "dotenv";
+import crypto from "node:crypto";
 
 dotenv.config();
 
-const JWT_SECRET = process.env.JWT_SECRET || "talentlens_secret_key_2025";
+const JWT_SECRET = process.env.JWT_SECRET || "development-only-change-this-secret";
 
 export function signToken(user) {
   return jwt.sign(
@@ -12,6 +13,7 @@ export function signToken(user) {
       email: user.email,
       name: user.name,
       role: user.role,
+      jti: crypto.randomUUID(),
     },
     JWT_SECRET,
     { expiresIn: "12h" }
