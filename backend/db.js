@@ -307,6 +307,7 @@ addColumn("users", "phone", "TEXT");
 addColumn("users", "profile_picture", "TEXT");
 addColumn("users", "active", "INTEGER NOT NULL DEFAULT 1");
 addColumn("users", "updated_at", "TEXT");
+addColumn("users", "username", "TEXT");
 addColumn("jobs", "description", "TEXT");
 addColumn("jobs", "requirements", "TEXT");
 addColumn("jobs", "company", "TEXT");
@@ -342,6 +343,10 @@ addColumn("resumes", "candidate_id", "INTEGER");
 addColumn("resumes", "mime_type", "TEXT");
 addColumn("resumes", "deleted_at", "TEXT");
 addColumn("resumes", "user_id", "INTEGER REFERENCES users(id) ON DELETE CASCADE");
+addColumn("resumes", "file_extension", "TEXT");
+addColumn("resumes", "file_size", "INTEGER NOT NULL DEFAULT 0");
+addColumn("resumes", "analysis_status", "TEXT NOT NULL DEFAULT 'Completed'");
+addColumn("resumes", "extraction_status", "TEXT NOT NULL DEFAULT 'completed'");
 addColumn("analyses", "candidate_id", "INTEGER");
 addColumn("analyses", "job_id", "INTEGER");
 addColumn("analyses", "skills_score", "INTEGER NOT NULL DEFAULT 0");
@@ -363,6 +368,19 @@ addColumn("screenings", "created_at", "TEXT");
 db.prepare(`
   INSERT OR IGNORE INTO application_settings (id) VALUES (1)
 `).run();
+
+for (const user of db.prepare("SELECT id,email,username FROM users").all()) {
+  if (!user.username) {
+    const base = String(user.email).split("@")[0].replace(/[^a-z0-9._-]/gi, "").slice(0, 40) || `user${user.id}`;
+    let username = base;
+    let suffix = 1;
+    while (db.prepare("SELECT id FROM users WHERE username=? AND id<>?").get(username, user.id)) {
+      username = `${base}${suffix++}`;
+    }
+    db.prepare("UPDATE users SET username=? WHERE id=?").run(username, user.id);
+  }
+}
+db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username) WHERE username IS NOT NULL");
 
 // Keep a setup-only default administrator; no recruitment or candidate demo records are seeded.
 const adminCount = db.prepare("SELECT COUNT(*) count FROM users WHERE role = 'admin'").get().count;

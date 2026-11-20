@@ -862,72 +862,76 @@ function CandidatesPage({
 function ResumesPage() {
   const [resumeText, setResumeText] = useState("");
   const [jobDescription, setJobDescription] = useState("");
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [resumes, setResumes] = useState<Array<{ id: number; original_name: string; file_size: number; mime_type: string; uploaded_at: string }>>([]);
   const [error, setError] = useState<string | null>(null);
-  const [isParsing, setIsParsing] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [progress, setProgress] = useState(0);
   const [result, setResult] = useState<AnalysisResult | null>(null);
   const fileInputRef = React.useRef<HTMLInputElement | null>(null);
 
-  const handleUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
+  useEffect(() => {
+    apiRequest("/api/resumes").then(setResumes).catch((err) => setError(err.message));
+  }, []);
 
+  const addFiles = (files: File[]) => {
     setError(null);
-    setIsParsing(true);
-
-    try {
-      let text = "";
-      if (file.type === "application/pdf") {
-        text = await extractTextFromPDF(file);
-      } else if (file.type === "text/plain") {
-        text = await file.text();
-      }
-
-      if (text && !text.trim()) {
-        throw new Error("Could not extract text from the file.");
-      }
-
-      setSelectedFile(file);
-      if (text) setResumeText(text);
-    } catch (err: any) {
-      setError(err?.message || "Failed to read file.");
-    } finally {
-      setIsParsing(false);
-      if (fileInputRef.current) fileInputRef.current.value = "";
-    }
-  };
-
-  const handleAnalyze = async () => {
-    if ((!resumeText && !selectedFile) || !jobDescription) {
-      setError("Please provide both a resume and a job description.");
+    const allowed = [".pdf", ".doc", ".docx", ".txt", ".jpg", ".jpeg", ".png"];
+    const invalid = files.find((file) => !allowed.some((extension) => file.name.toLowerCase().endsWith(extension)));
+    if (invalid) {
+      setError(`${invalid.name}: unsupported format`);
       return;
     }
+    setSelectedFiles((previous) => [...previous, ...files].slice(0, 10));
+  };
 
+  const uploadFile = (file: File) => new Promise<any>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", "/api/resumes/upload");
+    const token = localStorage.getItem("talentlens-token");
+    if (token) xhr.setRequestHeader("Authorization", `Bearer ${token}`);
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable) setProgress(Math.round((event.loaded / event.total) * 100));
+    };
+    xhr.onload = () => {
+      const data = JSON.parse(xhr.responseText || "{}");
+      if (xhr.status >= 200 && xhr.status < 300) resolve(data);
+      else reject(new Error(data.message || "Upload failed"));
+    };
+    xhr.onerror = () => reject(new Error("Network error during upload"));
+    const body = new FormData();
+    body.append("file", file);
+    body.append("jobDescription", jobDescription);
+    xhr.send(body);
+  });
+
+  const handleAnalyze = async () => {
+    if ((!resumeText.trim() && !selectedFiles.length) || !jobDescription.trim()) {
+      setError("Please provide a resume and a job description.");
+      return;
+    }
     setIsAnalyzing(true);
     setError(null);
-
+    setProgress(0);
     try {
-      let response;
-      if (selectedFile) {
-        const body = new FormData();
-        body.append("file", selectedFile);
-        body.append("candidateName", "Uploaded Candidate");
-        body.append("jobDescription", jobDescription);
-        response = await apiRequest("/api/upload-resume", { method: "POST", body });
-        response = response.analysis;
+      if (selectedFiles.length) {
+        let last: any = null;
+        for (const file of selectedFiles) last = await uploadFile(file);
+        setResult(last.analysis);
+        setResumes((previous) => [last.resume, ...previous]);
       } else {
-        response = await apiRequest("/api/analyze", {
+        const response = await apiRequest("/api/resumes/upload-text", {
           method: "POST",
-          body: JSON.stringify({ resumeText, jobDescription }),
+          body: JSON.stringify({ text: resumeText, jobDescription }),
         });
+        setResult(response.analysis);
+        setResumes((previous) => [response.resume, ...previous]);
       }
-
-      setResult(response);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to analyze resume. Please try again.");
+      setError(err instanceof Error ? err.message : "Upload or analysis failed");
     } finally {
       setIsAnalyzing(false);
+      setProgress(0);
     }
   };
 
@@ -936,7 +940,8 @@ function ResumesPage() {
     setError(null);
     setResumeText("");
     setJobDescription("");
-    setSelectedFile(null);
+    setSelectedFiles([]);
+    setProgress(0);
   };
 
   return (
@@ -949,8 +954,8 @@ function ResumesPage() {
 
         <label className="inline-flex cursor-pointer items-center gap-2 rounded-xl bg-[#111827] px-3.5 py-2.5 text-sm font-medium text-white">
           <UploadCloud className="h-4 w-4" />
-          Upload Resume
-          <input ref={fileInputRef} type="file" accept=".pdf,.docx,.txt,.png,.jpg,.jpeg" className="hidden" onChange={handleUpload} />
+          Browse files
+          <input ref={fileInputRef} type="file" multiple accept=".pdf,.doc,.docx,.txt,.png,.jpg,.jpeg" className="hidden" onChange={(event) => addFiles(Array.from(event.target.files || []))} />
         </label>
       </div>
 
@@ -962,16 +967,25 @@ function ResumesPage() {
                 <FileText className="h-5 w-5 text-[#5f6d82]" />
                 <h3 className="font-semibold text-[#111827]">Resume</h3>
               </div>
-              <button
-                onClick={() => fileInputRef.current?.click()}
-                disabled={isParsing}
-                className="inline-flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-[#5f6d82] hover:text-[#111827] disabled:opacity-50"
-              >
-                {isParsing ? <Loader2 className="h-3 w-3 animate-spin" /> : <UploadCloud className="h-3 w-3" />}
-                Upload
-              </button>
+              <button onClick={() => fileInputRef.current?.click()} className="text-xs font-semibold uppercase tracking-wider text-[#5f6d82]">Add files</button>
             </div>
-
+            <div
+              onDragOver={(event) => event.preventDefault()}
+              onDrop={(event) => { event.preventDefault(); addFiles(Array.from(event.dataTransfer.files)); }}
+              className="mb-4 rounded-xl border-2 border-dashed border-[#dfe4ec] p-4 text-center text-xs text-[#7a8598]"
+            >
+              Drag and drop PDF, DOC, DOCX, TXT, JPG, JPEG, or PNG files here
+            </div>
+            {selectedFiles.length > 0 && (
+              <div className="mb-4 space-y-2">
+                {selectedFiles.map((file, index) => (
+                  <div key={`${file.name}-${index}`} className="flex items-center justify-between rounded-lg bg-[#f8f9fc] px-3 py-2 text-xs">
+                    <span className="truncate">{file.name} · {(file.size / 1024).toFixed(1)} KB · {file.type || "unknown MIME"}</span>
+                    <button onClick={() => setSelectedFiles((previous) => previous.filter((_, item) => item !== index))} aria-label={`Remove ${file.name}`}><X className="h-4 w-4 text-[#c6405d]" /></button>
+                  </div>
+                ))}
+              </div>
+            )}
             <textarea
               value={resumeText}
               onChange={(e) => setResumeText(e.target.value)}
@@ -1073,12 +1087,34 @@ function ResumesPage() {
         <div className="flex justify-center">
           <button
             onClick={handleAnalyze}
-            disabled={isAnalyzing || isParsing}
+            disabled={isAnalyzing}
             className="inline-flex items-center justify-center rounded-xl bg-[#111827] px-6 py-3 text-sm font-medium text-white disabled:opacity-60"
           >
             {isAnalyzing ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Sparkles className="mr-2 h-4 w-4" />}
-            {isAnalyzing ? "Analyzing..." : "Analyze Match"}
+            {isAnalyzing ? `${progress ? `Uploading ${progress}%` : "Analyzing..."}` : "Analyze Match"}
           </button>
+        </div>
+      )}
+      {!!resumes.length && (
+        <div className="rounded-2xl border border-[#eaedf2] bg-white p-5">
+          <h3 className="mb-3 font-semibold text-[#111827]">Uploaded resumes</h3>
+          <div className="space-y-2">
+            {resumes.map((resume) => (
+              <div key={resume.id} className="flex items-center justify-between rounded-xl bg-[#f8f9fc] px-3 py-2 text-sm">
+                <span>{resume.original_name} · {(resume.file_size / 1024).toFixed(1)} KB</span>
+                <div className="flex gap-2">
+                  <a className="text-[#5e4bde]" href={`/api/resumes/${resume.id}/download`} onClick={(event) => {
+                    event.preventDefault();
+                    const token = localStorage.getItem("talentlens-token");
+                    fetch(`/api/resumes/${resume.id}/download`, { headers: token ? { Authorization: `Bearer ${token}` } : {} }).then((response) => response.blob()).then((blob) => {
+                      const url = URL.createObjectURL(blob); const link = document.createElement("a"); link.href = url; link.download = resume.original_name; link.click(); URL.revokeObjectURL(url);
+                    });
+                  }}>Download</a>
+                  <button className="text-[#c6405d]" onClick={async () => { await apiRequest(`/api/resumes/${resume.id}`, { method: "DELETE" }); setResumes((previous) => previous.filter((item) => item.id !== resume.id)); }}>Delete</button>
+                </div>
+              </div>
+            ))}
+          </div>
         </div>
       )}
     </div>
@@ -1284,10 +1320,12 @@ function ReportsPage({ reportData }: { reportData: { cards: Array<{ label: strin
 }
 
 function SettingsPage() {
-  const [profile, setProfile] = useState({ name: "", displayName: "", email: "", phone: "" });
+  const [profile, setProfile] = useState({ name: "", username: "", displayName: "", email: "", phone: "", profilePicture: "" });
   const [theme, setTheme] = useState("system");
   const [message, setMessage] = useState("");
   const [passwords, setPasswords] = useState({ currentPassword: "", newPassword: "", confirmPassword: "" });
+  const [showPasswords, setShowPasswords] = useState(false);
+  const [emailPassword, setEmailPassword] = useState("");
 
   useEffect(() => {
     apiRequest("/api/settings")
@@ -1300,10 +1338,21 @@ function SettingsPage() {
 
   const saveProfile = async () => {
     try {
-      await apiRequest("/api/settings/profile", { method: "PUT", body: JSON.stringify(profile) });
+      const data = await apiRequest("/api/settings/profile", { method: "PUT", body: JSON.stringify(profile) });
+      setProfile((previous) => ({ ...previous, ...data.profile }));
       setMessage("Profile saved");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Failed to save profile");
+    }
+  };
+
+  const saveEmail = async () => {
+    try {
+      await apiRequest("/api/settings/email", { method: "PUT", body: JSON.stringify({ email: profile.email, currentPassword: emailPassword }) });
+      setEmailPassword("");
+      setMessage("Email updated");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Failed to update email");
     }
   };
 
@@ -1340,9 +1389,10 @@ function SettingsPage() {
           <div className="grid gap-3">
             {([
               ["name", "Name"],
+              ["username", "Username"],
               ["displayName", "Display name"],
-              ["email", "Email"],
               ["phone", "Phone"],
+              ["profilePicture", "Profile picture URL"],
             ] as const).map(([key, label]) => (
               <label key={key} className="text-sm text-[#5f6d82]">
                 {label}
@@ -1350,6 +1400,11 @@ function SettingsPage() {
               </label>
             ))}
             <button onClick={saveProfile} className="mt-2 rounded-xl bg-[#111827] px-4 py-2.5 text-sm text-white">Save profile</button>
+            <label className="text-sm text-[#5f6d82]">Email
+              <input value={profile.email} onChange={(e) => setProfile((prev) => ({ ...prev, email: e.target.value }))} className="mt-1 w-full rounded-xl border border-[#e9edf3] bg-[#f8f9fc] px-3 py-2.5" />
+            </label>
+            <input type="password" value={emailPassword} placeholder="Current password to change email" onChange={(e) => setEmailPassword(e.target.value)} className="w-full rounded-xl border border-[#e9edf3] bg-[#f8f9fc] px-3 py-2.5 text-sm" />
+            <button onClick={saveEmail} className="rounded-xl border border-[#e9edf3] px-4 py-2.5 text-sm text-[#111827]">Update email</button>
           </div>
         </div>
         <div className="space-y-6">
@@ -1369,8 +1424,10 @@ function SettingsPage() {
                 ["newPassword", "New password"],
                 ["confirmPassword", "Confirm password"],
               ] as const).map(([key, label]) => (
-                <input key={key} type="password" value={passwords[key]} placeholder={label} onChange={(e) => setPasswords((prev) => ({ ...prev, [key]: e.target.value }))} className="w-full rounded-xl border border-[#e9edf3] bg-[#f8f9fc] px-3 py-2.5 text-sm" />
+                <input key={key} type={showPasswords ? "text" : "password"} value={passwords[key]} placeholder={label} onChange={(e) => setPasswords((prev) => ({ ...prev, [key]: e.target.value }))} className="w-full rounded-xl border border-[#e9edf3] bg-[#f8f9fc] px-3 py-2.5 text-sm" />
               ))}
+              <button onClick={() => setShowPasswords((value) => !value)} className="text-left text-xs text-[#5f6d82]">{showPasswords ? "Hide passwords" : "Show passwords"}</button>
+              {passwords.newPassword && <div className="text-xs text-[#5f6d82]">Password strength: {passwords.newPassword.length >= 12 ? "strong" : passwords.newPassword.length >= 8 ? "acceptable" : "too short"}</div>}
               <button onClick={changePassword} className="rounded-xl bg-[#111827] px-4 py-2.5 text-sm text-white">Change password</button>
             </div>
           </div>
