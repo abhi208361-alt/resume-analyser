@@ -11,9 +11,11 @@ import mammoth from "mammoth";
 import bcrypt from "bcryptjs";
 import PDFDocument from "pdfkit";
 import { createRequire } from "node:module";
+import WordExtractor from "word-extractor";
 
 const require = createRequire(import.meta.url);
 const { recognize } = require("tesseract.js");
+const wordExtractor = new WordExtractor();
 
 import { db } from "./db.js";
 import { analyzeResume, extractResumeData } from "./gemini.js";
@@ -41,12 +43,16 @@ const upload = multer({
   fileFilter: (_req, file, cb) => {
     const allowed = new Set([
       "application/pdf",
+      "application/msword",
+      "application/octet-stream",
       "text/plain",
       "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
       "image/png",
       "image/jpeg",
     ]);
-    cb(allowed.has(file.mimetype) ? null : new Error("Unsupported file type"), allowed.has(file.mimetype));
+    const extension = path.extname(file.originalname).toLowerCase();
+    const allowedExtension = new Set([".pdf", ".doc", ".docx", ".txt", ".jpg", ".jpeg", ".png"]).has(extension);
+    cb(allowed.has(file.mimetype) && allowedExtension ? null : Object.assign(new Error("Unsupported file type"), { status: 400 }), allowed.has(file.mimetype) && allowedExtension);
   },
 });
 
@@ -67,6 +73,7 @@ function safeUser(user) {
   return {
     id: user.id,
     name: user.name,
+    username: user.username || "",
     displayName: user.display_name || user.name,
     email: user.email,
     role: user.role,
@@ -94,9 +101,26 @@ function pagination(req) {
 }
 
 async function extractText(file) {
+  const header = fs.readFileSync(file.path).subarray(0, 8);
+  const extension = path.extname(file.originalname).toLowerCase();
+  const signatures = {
+    ".pdf": header.toString("ascii", 0, 4) === "%PDF",
+    ".png": header.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])),
+    ".jpg": header.subarray(0, 3).equals(Buffer.from([255, 216, 255])),
+    ".jpeg": header.subarray(0, 3).equals(Buffer.from([255, 216, 255])),
+    ".doc": header.subarray(0, 8).equals(Buffer.from([208, 207, 17, 224, 161, 177, 26, 225])),
+    ".docx": header.subarray(0, 2).toString("ascii") === "PK",
+  };
+  if (extension !== ".txt" && !signatures[extension]) {
+    throw Object.assign(new Error("The file content does not match its extension"), { status: 400 });
+  }
   if (file.mimetype === "application/pdf") {
     const parsed = await pdfParse(fs.readFileSync(file.path));
     if (String(parsed.text || "").trim().length >= 20) return parsed.text;
+  }
+  if (extension === ".doc") {
+    const document = await wordExtractor.extract(file.path);
+    return document.getBody();
   }
   if (file.mimetype === "application/vnd.openxmlformats-officedocument.wordprocessingml.document") {
     return (await mammoth.extractRawText({ path: file.path })).value;
@@ -106,7 +130,7 @@ async function extractText(file) {
     const result = await recognize(file.path, "eng");
     return result.data.text;
   }
-  throw new Error("The file type could not be extracted");
+  throw Object.assign(new Error("The file type could not be extracted"), { status: 422 });
 }
 
 function parseJson(value, fallback = {}) {
@@ -426,7 +450,10 @@ app.get("/api/resumes", verifyToken, (req, res) => {
   const rows = isAdmin(req)
     ? db.prepare(sql).all(limit, offset)
     : db.prepare(sql).all(uid(req), limit, offset);
-  res.json(rows);
+  res.json(rows.map(({ stored_path, file_name, ...resume }) => ({
+    ...resume,
+    storedFilename: file_name,
+  })));
 });
 
 async function storeAndAnalyze(req, file, body) {
@@ -462,9 +489,10 @@ async function storeAndAnalyze(req, file, body) {
   }
 
   const resumeResult = db.prepare(`
-    INSERT INTO resumes (candidate_id,candidate_name,file_name,original_name,mime_type,stored_path,status,score,user_id,uploaded_at)
-    VALUES (?, ?, ?, ?, ?, ?, 'Analyzed', ?, ?, CURRENT_TIMESTAMP)
-  `).run(candidateId, String(body.candidateName || extracted.fullName || "Uploaded Candidate"), file.filename, file.originalname, file.mimetype, file.path, analysis.score, uid(req));
+    INSERT INTO resumes (candidate_id,candidate_name,file_name,original_name,file_extension,mime_type,file_size,stored_path,status,analysis_status,extraction_status,score,user_id,uploaded_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Analyzed', 'Completed', 'completed', ?, ?, CURRENT_TIMESTAMP)
+  `).run(candidateId, String(body.candidateName || extracted.fullName || "Uploaded Candidate"), file.filename, file.originalname,
+    path.extname(file.originalname).toLowerCase(), file.mimetype, file.size, file.path, analysis.score, uid(req));
   const resumeId = resumeResult.lastInsertRowid;
   db.prepare("INSERT INTO resume_files (resume_id,stored_path,original_name,mime_type,size_bytes,sha256) VALUES (?, ?, ?, ?, ?, ?)")
     .run(resumeId, file.path, file.originalname, file.mimetype, file.size, crypto.createHash("sha256").update(fs.readFileSync(file.path)).digest("hex"));
@@ -507,10 +535,53 @@ app.post("/api/upload-resume", verifyToken, upload.single("file"), async (req, r
       resume: db.prepare("SELECT * FROM resumes WHERE id=?").get(stored.resumeId),
       analysis: { ...stored.analysis, resumeId: stored.resumeId, analysisId: stored.analysisId },
     });
+
   } catch (error) {
     if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
     next(error);
   }
+});
+
+app.post("/api/resumes/upload", verifyToken, upload.single("file"), async (req, res, next) => {
+  try {
+    if (!req.file) return res.status(400).json({ message: "No file uploaded" });
+    const stored = await storeAndAnalyze(req, req.file, req.body || {});
+    res.status(201).json({
+      resume: db.prepare("SELECT id,user_id,original_name,file_name,file_extension,mime_type,file_size,status,analysis_status,extraction_status,uploaded_at FROM resumes WHERE id=?").get(stored.resumeId),
+      analysis: { ...stored.analysis, resumeId: stored.resumeId, analysisId: stored.analysisId },
+    });
+  } catch (error) {
+    if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+    next(error);
+  }
+});
+
+app.post("/api/resumes/upload-text", verifyToken, async (req, res, next) => {
+  const text = String(req.body?.text || req.body?.resumeText || "").trim();
+  if (text.length < 20) return res.status(400).json({ message: "Resume text must contain at least 20 characters" });
+  const filePath = path.join(uploadsDir, `${crypto.randomUUID()}.txt`);
+  const file = { path: filePath, filename: path.basename(filePath), originalname: "pasted-resume.txt", mimetype: "text/plain", size: Buffer.byteLength(text, "utf8") };
+  try {
+    fs.writeFileSync(filePath, text, "utf8");
+    const stored = await storeAndAnalyze(req, file, req.body || {});
+    res.status(201).json({
+      resume: db.prepare("SELECT id,user_id,original_name,file_name,file_extension,mime_type,file_size,status,analysis_status,extraction_status,uploaded_at FROM resumes WHERE id=?").get(stored.resumeId),
+      analysis: { ...stored.analysis, resumeId: stored.resumeId, analysisId: stored.analysisId },
+    });
+  } catch (error) {
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    next(error);
+  }
+});
+
+app.get("/api/resumes/:id", verifyToken, (req, res) => {
+  const resume = db.prepare(`
+    SELECT id,user_id,candidate_id,candidate_name,original_name,file_extension,mime_type,file_size,status,analysis_status,extraction_status,uploaded_at
+    FROM resumes WHERE id=? AND deleted_at IS NULL
+  `).get(req.params.id);
+  if (!resume) return res.status(404).json({ message: "Resume not found" });
+  if (!isAdmin(req) && resume.user_id !== uid(req)) return res.status(403).json({ message: "Access denied" });
+  res.json(resume);
 });
 
 app.post("/api/resumes/upload-multiple", verifyToken, upload.array("files", 10), async (req, res, next) => {
@@ -521,6 +592,7 @@ app.post("/api/resumes/upload-multiple", verifyToken, upload.array("files", 10),
       try {
         results.push({ file: file.originalname, ...await storeAndAnalyze(req, file, req.body || {}) });
       } catch (error) {
+        if (fs.existsSync(file.path)) fs.unlinkSync(file.path);
         results.push({ file: file.originalname, error: error.message, status: "Failed" });
       }
     }
@@ -785,6 +857,7 @@ app.get("/api/settings", verifyToken, (req, res) => {
   res.json({
     profile: {
       name: user.name,
+      username: user.username || "",
       displayName: profile?.display_name || user.display_name || user.name,
       email: user.email,
       phone: profile?.phone || user.phone || "",
@@ -802,12 +875,19 @@ app.get("/api/settings", verifyToken, (req, res) => {
 app.put("/api/settings/profile", verifyToken, (req, res) => {
   const b = req.body || {};
   const user = db.prepare("SELECT * FROM users WHERE id=?").get(uid(req));
+  const username = String(b.username || user.username || "").trim();
+  if (!username || !/^[a-zA-Z0-9._-]{3,40}$/.test(username)) {
+    return res.status(400).json({ message: "Username must be 3-40 characters and contain only letters, numbers, dots, underscores, or hyphens" });
+  }
+  const usernameConflict = db.prepare("SELECT id FROM users WHERE username=? AND id<>?").get(username, uid(req));
+  if (usernameConflict) return res.status(409).json({ message: "Username is already in use" });
   const email = String(b.email || user.email).trim().toLowerCase();
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ message: "A valid email is required" });
+  if (email !== user.email) return res.status(400).json({ message: "Use the email change endpoint with your current password" });
   const conflict = db.prepare("SELECT id FROM users WHERE email=? AND id<>?").get(email, uid(req));
   if (conflict) return res.status(409).json({ message: "Email is already in use" });
-  db.prepare("UPDATE users SET name=?,display_name=?,email=?,phone=?,profile_picture=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
-    .run(String(b.name || b.displayName || user.name).trim(), b.displayName || user.display_name || user.name, email,
+  db.prepare("UPDATE users SET name=?,username=?,display_name=?,email=?,phone=?,profile_picture=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
+    .run(String(b.name || b.displayName || user.name).trim(), username, b.displayName || user.display_name || user.name, email,
       b.phone || "", b.profilePicture || "", uid(req));
   db.prepare(`
     INSERT INTO user_profiles (user_id,display_name,phone,profile_picture)
@@ -817,7 +897,25 @@ app.put("/api/settings/profile", verifyToken, (req, res) => {
   `).run(uid(req), b.displayName || b.name || user.name, b.phone || "", b.profilePicture || "");
   activity(req, "profile_update");
   audit(req, "profile_update");
-  res.json({ success: true });
+  const updated = db.prepare("SELECT * FROM users WHERE id=?").get(uid(req));
+  res.json({ success: true, profile: { ...safeUser(updated), phone: updated.phone || "", profilePicture: updated.profile_picture || "" } });
+});
+
+app.put("/api/settings/email", verifyToken, async (req, res, next) => {
+  try {
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ message: "A valid email is required" });
+    const user = db.prepare("SELECT password,email FROM users WHERE id=?").get(uid(req));
+    if (!(await bcrypt.compare(String(req.body?.currentPassword || ""), user.password))) {
+      return res.status(401).json({ message: "Current password is required to change email" });
+    }
+    if (db.prepare("SELECT id FROM users WHERE email=? AND id<>?").get(email, uid(req))) {
+      return res.status(409).json({ message: "Email is already in use" });
+    }
+    db.prepare("UPDATE users SET email=?,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(email, uid(req));
+    audit(req, "email_update");
+    res.json({ success: true, email });
+  } catch (error) { next(error); }
 });
 
 app.put("/api/settings/appearance", verifyToken, (req, res) => {
@@ -830,6 +928,27 @@ app.put("/api/settings/appearance", verifyToken, (req, res) => {
       updated_at=CURRENT_TIMESTAMP
   `).run(uid(req), theme, JSON.stringify(req.body.sidebar || {}), JSON.stringify(req.body.dashboard || {}));
   activity(req, "settings_change", null, null, { category: "appearance" });
+  res.json({ success: true, theme });
+});
+
+app.get("/api/settings/preferences", verifyToken, (req, res) => {
+  const preferences = db.prepare("SELECT * FROM user_settings WHERE user_id=?").get(uid(req));
+  res.json({
+    theme: preferences?.theme || "system",
+    sidebar: parseJson(preferences?.sidebar_preferences),
+    dashboard: parseJson(preferences?.dashboard_preferences),
+  });
+});
+
+app.put("/api/settings/preferences", verifyToken, (req, res) => {
+  const theme = ["light", "dark", "system"].includes(req.body?.theme) ? req.body.theme : "system";
+  db.prepare(`
+    INSERT INTO user_settings (user_id,theme,sidebar_preferences,dashboard_preferences)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET theme=excluded.theme,
+      sidebar_preferences=excluded.sidebar_preferences,dashboard_preferences=excluded.dashboard_preferences,
+      updated_at=CURRENT_TIMESTAMP
+  `).run(uid(req), theme, JSON.stringify(req.body?.sidebar || {}), JSON.stringify(req.body?.dashboard || {}));
   res.json({ success: true, theme });
 });
 
@@ -882,6 +1001,12 @@ app.get("/api/users", verifyToken, adminOnly, (req, res) => {
   res.json(rows);
 });
 
+app.get("/api/users/:id", verifyToken, adminOnly, (req, res) => {
+  const user = db.prepare("SELECT id,name,username,email,role,active,display_name,phone,profile_picture,created_at,updated_at FROM users WHERE id=?").get(req.params.id);
+  if (!user) return res.status(404).json({ message: "User not found" });
+  res.json(user);
+});
+
 app.post("/api/users", verifyToken, adminOnly, async (req, res, next) => {
   try {
     const { name, email, password, role = "user" } = req.body || {};
@@ -907,10 +1032,13 @@ app.put("/api/users/:id", verifyToken, adminOnly, (req, res) => {
     return res.status(403).json({ message: "Another administrator account cannot be demoted" });
   }
   const role = ["admin", "user"].includes(req.body.role) ? req.body.role : target.role;
+  const email = req.body.email ? String(req.body.email).trim().toLowerCase() : target.email;
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ message: "A valid email is required" });
+  if (db.prepare("SELECT id FROM users WHERE email=? AND id<>?").get(email, target.id)) return res.status(409).json({ message: "Email already exists" });
   db.prepare("UPDATE users SET name=?,email=?,role=?,active=?,display_name=?,phone=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
     .run(
       req.body.name || target.name,
-      req.body.email ? String(req.body.email).trim().toLowerCase() : target.email,
+      email,
       role,
       req.body.active == null ? target.active : (req.body.active ? 1 : 0),
       req.body.displayName ?? target.display_name ?? target.name,
@@ -919,6 +1047,19 @@ app.put("/api/users/:id", verifyToken, adminOnly, (req, res) => {
     );
   audit(req, "user_update", target.email, "user", target.id);
   res.json(db.prepare("SELECT id,name,email,role,active,display_name,phone,created_at,updated_at FROM users WHERE id=?").get(target.id));
+});
+
+app.post("/api/users/:id/password-reset", verifyToken, adminOnly, async (req, res, next) => {
+  try {
+    const target = db.prepare("SELECT id,email FROM users WHERE id=?").get(req.params.id);
+    if (!target) return res.status(404).json({ message: "User not found" });
+    const temporaryPassword = String(req.body?.temporaryPassword || "");
+    if (temporaryPassword.length < 8) return res.status(400).json({ message: "A temporary password of at least 8 characters is required" });
+    db.prepare("UPDATE users SET password=?,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(await bcrypt.hash(temporaryPassword, 12), target.id);
+    db.prepare("UPDATE user_sessions SET revoked_at=CURRENT_TIMESTAMP WHERE user_id=?").run(target.id);
+    audit(req, "user_password_reset", target.email, "user", target.id);
+    res.json({ success: true });
+  } catch (error) { next(error); }
 });
 
 app.post("/api/users/:id/deactivate", verifyToken, adminOnly, (req, res) => {
