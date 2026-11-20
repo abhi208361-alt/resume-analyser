@@ -171,16 +171,6 @@ const statusClasses: Record<StatusValue, string> = {
   "Not Configured": "bg-[#edf0f5] text-[#606c7c] border border-[#dfe3eb]",
 };
 
-const demoReports = {
-  cards: [
-    { label: "Avg Match Score", value: "84%", delta: "+4.6%" },
-    { label: "Time to Screen", value: "2.4d", delta: "-12%" },
-    { label: "Offer Rate", value: "31%", delta: "+2.1%" },
-    { label: "Hidden Talent", value: "14%", delta: "+6%" },
-  ],
-  velocity: [42, 58, 76, 63, 85, 92, 74],
-};
-
 function cn(...values: Array<string | false | null | undefined>) {
   return values.filter(Boolean).join(" ");
 }
@@ -322,7 +312,7 @@ function exportCsv(filename: string, rows: Array<Record<string, string | number>
   URL.revokeObjectURL(url);
 }
 
-function exportReportPdf() {
+function exportReportPdf(cards: Array<{ label: string; value: string | number; delta: string }> = []) {
   const doc = new jsPDF();
 
   doc.setFontSize(18);
@@ -334,7 +324,7 @@ function exportReportPdf() {
   doc.setFontSize(12);
   doc.text("Summary metrics", 14, 38);
 
-  demoReports.cards.forEach((card, index) => {
+  cards.forEach((card, index) => {
     const y = 48 + index * 12;
     doc.text(`${card.label}: ${card.value} (${card.delta})`, 14, y);
   });
@@ -387,7 +377,7 @@ function LandingPage() {
                 <p className="text-[10px] font-medium uppercase tracking-[0.18em] text-[#7d889d]">
                   Live pipeline
                 </p>
-                <p className="mt-2 text-2xl font-semibold text-[#111827]">1,872</p>
+                <p className="mt-2 text-2xl font-semibold text-[#111827]">Database-backed</p>
               </div>
               <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-[#f1ebff] text-[#604ae5]">
                 <TrendingUp className="h-5 w-5" />
@@ -396,10 +386,10 @@ function LandingPage() {
 
             <div className="grid grid-cols-2 gap-3">
               {[
-                { label: "Shortlisted", value: "412" },
-                { label: "Interviewing", value: "84" },
-                { label: "Offers", value: "19" },
-                { label: "Avg. fit", value: "84%" },
+                { label: "Job records", value: "Live" },
+                { label: "Candidates", value: "Live" },
+                { label: "Analyses", value: "Live" },
+                { label: "Reports", value: "Live" },
               ].map((item) => (
                 <div key={item.label} className="rounded-xl border border-[#edf0f5] bg-white p-3">
                   <p className="text-[11px] text-[#7a8598]">{item.label}</p>
@@ -676,7 +666,7 @@ function CandidatesPage({
     name: "",
     email: "",
     job_title: "",
-    status: "In Review",
+    status: "New",
     score: "0",
     skills: "",
   });
@@ -686,7 +676,7 @@ function CandidatesPage({
       name: "",
       email: "",
       job_title: "",
-      status: "In Review",
+      status: "New",
       score: "0",
       skills: "",
     });
@@ -781,10 +771,13 @@ function CandidatesPage({
                 onChange={(e) => setForm((prev) => ({ ...prev, status: e.target.value }))}
                 className="w-full rounded-xl border border-[#e9edf3] bg-[#f8f9fc] px-3 py-2.5 text-sm outline-none"
               >
-                <option value="In Review">In Review</option>
-                <option value="Interview">Interview</option>
-                <option value="Strong Match">Strong Match</option>
+                <option value="New">New</option>
+                <option value="Under Review">Under Review</option>
+                <option value="Shortlisted">Shortlisted</option>
+                <option value="Interview Scheduled">Interview Scheduled</option>
+                <option value="Selected">Selected</option>
                 <option value="Rejected">Rejected</option>
+                <option value="On Hold">On Hold</option>
               </select>
             </div>
             <div>
@@ -932,7 +925,7 @@ function ResumesPage() {
 
       setResult(response);
     } catch (err) {
-      setError("Failed to analyze resume. Please try again.");
+      setError(err instanceof Error ? err.message : "Failed to analyze resume. Please try again.");
     } finally {
       setIsAnalyzing(false);
     }
@@ -957,7 +950,7 @@ function ResumesPage() {
         <label className="inline-flex cursor-pointer items-center gap-2 rounded-xl bg-[#111827] px-3.5 py-2.5 text-sm font-medium text-white">
           <UploadCloud className="h-4 w-4" />
           Upload Resume
-          <input ref={fileInputRef} type="file" accept=".pdf,.docx,.txt" className="hidden" onChange={handleUpload} />
+          <input ref={fileInputRef} type="file" accept=".pdf,.docx,.txt,.png,.jpg,.jpeg" className="hidden" onChange={handleUpload} />
         </label>
       </div>
 
@@ -1233,21 +1226,26 @@ function ReportsPage({ reportData }: { reportData: { cards: Array<{ label: strin
         <div className="flex items-center gap-3">
           <button
             className="inline-flex items-center gap-2 rounded-xl border border-[#edf1f5] bg-white px-3.5 py-2.5 text-sm font-medium text-[#1f2937]"
-            onClick={() =>
-              exportCsv("talentlens-report.csv", [
-                { Metric: "Avg Match Score", Value: "84%" },
-                { Metric: "Time to Screen", Value: "2.4d" },
-                { Metric: "Offer Rate", Value: "31%" },
-                { Metric: "Hidden Talent", Value: "14%" },
-              ])
-            }
+            onClick={() => {
+              const token = localStorage.getItem("talentlens-token");
+              fetch("/api/reports/export/csv", { headers: token ? { Authorization: `Bearer ${token}` } : {} })
+                .then((response) => response.blob())
+                .then((blob) => {
+                  const url = URL.createObjectURL(blob);
+                  const link = document.createElement("a");
+                  link.href = url;
+                  link.download = "talentlens-candidates.csv";
+                  link.click();
+                  URL.revokeObjectURL(url);
+                });
+            }}
           >
             <Download className="h-4 w-4" />
             CSV
           </button>
           <button
             className="inline-flex items-center gap-2 rounded-xl bg-[#111827] px-3.5 py-2.5 text-sm font-medium text-white"
-            onClick={exportReportPdf}
+            onClick={() => exportReportPdf(reportData?.cards || [])}
           >
             <Download className="h-4 w-4" />
             PDF
@@ -1286,31 +1284,96 @@ function ReportsPage({ reportData }: { reportData: { cards: Array<{ label: strin
 }
 
 function SettingsPage() {
-  const settings = [
-    { label: "Theme", value: "Light" },
-    { label: "Review Policy", value: "Human override required" },
-    { label: "AI Provider", value: "Google Gemini" },
-    { label: "PDF Parser", value: "PDF.js + extraction" },
-  ];
+  const [profile, setProfile] = useState({ name: "", displayName: "", email: "", phone: "" });
+  const [theme, setTheme] = useState("system");
+  const [message, setMessage] = useState("");
+  const [passwords, setPasswords] = useState({ currentPassword: "", newPassword: "", confirmPassword: "" });
+
+  useEffect(() => {
+    apiRequest("/api/settings")
+      .then((data) => {
+        setProfile(data.profile);
+        setTheme(data.appearance?.theme || "system");
+      })
+      .catch((error) => setMessage(error instanceof Error ? error.message : "Failed to load settings"));
+  }, []);
+
+  const saveProfile = async () => {
+    try {
+      await apiRequest("/api/settings/profile", { method: "PUT", body: JSON.stringify(profile) });
+      setMessage("Profile saved");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Failed to save profile");
+    }
+  };
+
+  const saveAppearance = async (value: string) => {
+    setTheme(value);
+    try {
+      await apiRequest("/api/settings/appearance", { method: "PUT", body: JSON.stringify({ theme: value }) });
+      setMessage("Appearance saved");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Failed to save appearance");
+    }
+  };
+
+  const changePassword = async () => {
+    try {
+      await apiRequest("/api/settings/password", { method: "PUT", body: JSON.stringify(passwords) });
+      setPasswords({ currentPassword: "", newPassword: "", confirmPassword: "" });
+      setMessage("Password changed");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Failed to change password");
+    }
+  };
 
   return (
     <div className="space-y-6">
       <div>
         <h2 className="text-2xl font-semibold text-[#111827]">Settings</h2>
-        <p className="text-sm text-[#7a8598]">Workspace and integration preferences</p>
+        <p className="text-sm text-[#7a8598]">Persistent account and appearance preferences</p>
       </div>
-
-      <div className="rounded-2xl border border-[#eaedf2] bg-white p-5 shadow-[0_1px_0_rgba(15,23,42,0.02)]">
-        <div className="space-y-4">
-          {settings.map((item) => (
-            <div
-              key={item.label}
-              className="flex items-center justify-between border-b border-[#edf1f5] pb-3 last:border-0 last:pb-0"
-            >
-              <span className="text-sm text-[#667287]">{item.label}</span>
-              <span className="text-sm font-medium text-[#1d2430]">{item.value}</span>
+      {message && <div className="rounded-xl border border-[#edf1f5] bg-white px-4 py-3 text-sm text-[#5f6d82]">{message}</div>}
+      <div className="grid gap-6 lg:grid-cols-2">
+        <div className="rounded-2xl border border-[#eaedf2] bg-white p-5">
+          <h3 className="mb-4 font-semibold text-[#111827]">Profile</h3>
+          <div className="grid gap-3">
+            {([
+              ["name", "Name"],
+              ["displayName", "Display name"],
+              ["email", "Email"],
+              ["phone", "Phone"],
+            ] as const).map(([key, label]) => (
+              <label key={key} className="text-sm text-[#5f6d82]">
+                {label}
+                <input value={profile[key]} onChange={(e) => setProfile((prev) => ({ ...prev, [key]: e.target.value }))} className="mt-1 w-full rounded-xl border border-[#e9edf3] bg-[#f8f9fc] px-3 py-2.5" />
+              </label>
+            ))}
+            <button onClick={saveProfile} className="mt-2 rounded-xl bg-[#111827] px-4 py-2.5 text-sm text-white">Save profile</button>
+          </div>
+        </div>
+        <div className="space-y-6">
+          <div className="rounded-2xl border border-[#eaedf2] bg-white p-5">
+            <h3 className="mb-4 font-semibold text-[#111827]">Appearance</h3>
+            <select value={theme} onChange={(e) => saveAppearance(e.target.value)} className="w-full rounded-xl border border-[#e9edf3] bg-[#f8f9fc] px-3 py-2.5 text-sm">
+              <option value="system">System default</option>
+              <option value="light">Light</option>
+              <option value="dark">Dark</option>
+            </select>
+          </div>
+          <div className="rounded-2xl border border-[#eaedf2] bg-white p-5">
+            <h3 className="mb-4 font-semibold text-[#111827]">Change password</h3>
+            <div className="grid gap-3">
+              {([
+                ["currentPassword", "Current password"],
+                ["newPassword", "New password"],
+                ["confirmPassword", "Confirm password"],
+              ] as const).map(([key, label]) => (
+                <input key={key} type="password" value={passwords[key]} placeholder={label} onChange={(e) => setPasswords((prev) => ({ ...prev, [key]: e.target.value }))} className="w-full rounded-xl border border-[#e9edf3] bg-[#f8f9fc] px-3 py-2.5 text-sm" />
+              ))}
+              <button onClick={changePassword} className="rounded-xl bg-[#111827] px-4 py-2.5 text-sm text-white">Change password</button>
             </div>
-          ))}
+          </div>
         </div>
       </div>
     </div>
@@ -1319,8 +1382,10 @@ function SettingsPage() {
 
 function DashboardPage({
   dashboard,
+  models,
 }: {
   dashboard: DashboardReadout | null;
+  models: ModelHealth[];
 }) {
   if (!dashboard) {
     return (
@@ -1343,7 +1408,7 @@ function DashboardPage({
           </div>
           <div className="inline-flex items-center gap-2 rounded-xl border border-[#ebeff4] bg-[#f8f9fc] px-3 py-2 text-xs text-[#59667d]">
             <CircleDashed className="h-3.5 w-3.5" />
-            Updated 9 minutes ago
+            Live database
           </div>
         </div>
       </div>
@@ -1417,12 +1482,7 @@ function DashboardPage({
           </div>
 
           <div className="space-y-3">
-            {[
-              { name: "Resume parsing / extraction", status: "Healthy", detail: "Avg latency 1.1s" },
-              { name: "AI scoring / analysis", status: "Degraded", detail: "3 recent spikes" },
-              { name: "Skills extraction", status: "Healthy", detail: "92% confidence" },
-              { name: "Duplicate detection", status: "Not Configured", detail: "Disabled in tenant" },
-            ].map((model) => (
+            {models.map((model) => (
               <div key={model.name} className="rounded-2xl border border-[#eef1f4] bg-[#f8f9fc] p-3">
                 <div className="flex items-center justify-between gap-3">
                   <div>
@@ -1721,7 +1781,7 @@ export default function App() {
       case "Landing":
         return <LandingPage />;
       case "Dashboard":
-        return <DashboardPage dashboard={dashboard} />;
+        return <DashboardPage dashboard={dashboard} models={models} />;
       case "Jobs":
         return <JobsPage jobs={jobs} onCreate={handleCreateJob} onUpdate={handleUpdateJob} onDelete={handleDeleteJob} />;
       case "Candidates":
@@ -1748,7 +1808,7 @@ export default function App() {
       case "Settings":
         return <SettingsPage />;
       default:
-        return <DashboardPage dashboard={dashboard} />;
+        return <DashboardPage dashboard={dashboard} models={models} />;
     }
   };
 
@@ -1899,8 +1959,14 @@ export default function App() {
                   <UserRound className="h-4 w-4" />
                 </div>
                 <div className="min-w-0">
-                  <div className="truncate text-sm font-medium text-[#111827]">Ava Morgan</div>
-                  <div className="text-[11px] text-[#7a8598]">Talent Lead</div>
+                  <div className="truncate text-sm font-medium text-[#111827]">
+                    {JSON.parse(localStorage.getItem("talentlens-user") || "{}").displayName ||
+                      JSON.parse(localStorage.getItem("talentlens-user") || "{}").name ||
+                      "User"}
+                  </div>
+                  <div className="text-[11px] text-[#7a8598]">
+                    {JSON.parse(localStorage.getItem("talentlens-user") || "{}").role || "User"}
+                  </div>
                 </div>
               </div>
             </div>
@@ -1963,7 +2029,7 @@ export default function App() {
 
           <main className="px-4 py-6 sm:px-6">
             <div className="mb-4 rounded-xl border border-[#edf1f5] bg-[#f7f9fb] px-3 py-2 text-[11px] text-[#687687]">
-              Real-time demo mode • Updates every 5s
+              Live database data
             </div>
             {renderPage()}
           </main>

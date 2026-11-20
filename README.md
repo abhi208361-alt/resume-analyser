@@ -29,6 +29,20 @@ AI-powered resume screening and recruitment analytics interface.
 5. Open:
    http://localhost:3000
 
+## Windows PowerShell
+```powershell
+cd <repository-folder>
+npm install
+Copy-Item .env.example .env
+npm run dev
+```
+
+For separate terminal processes:
+```powershell
+npm run server
+npm run client
+```
+
 ## Login
 - Email: admin@talentlens.ai
 - Password: admin123
