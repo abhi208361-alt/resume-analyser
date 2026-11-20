@@ -93,6 +93,8 @@ type Candidate = {
   status: string;
   score: number;
   skills?: string;
+  technical_skills?: string;
+  ats_score?: number;
   created_at?: string;
 };
 
@@ -312,7 +314,10 @@ function exportCsv(filename: string, rows: Array<Record<string, string | number>
   URL.revokeObjectURL(url);
 }
 
-function exportReportPdf(cards: Array<{ label: string; value: string | number; delta: string }> = []) {
+function exportReportPdf(
+  cards: Array<{ label: string; value: string | number; delta: string }> = [],
+  candidates: Candidate[] = []
+) {
   const doc = new jsPDF();
 
   doc.setFontSize(18);
@@ -327,6 +332,26 @@ function exportReportPdf(cards: Array<{ label: string; value: string | number; d
   cards.forEach((card, index) => {
     const y = 48 + index * 12;
     doc.text(`${card.label}: ${card.value} (${card.delta})`, 14, y);
+  });
+
+  let y = 48 + cards.length * 12 + 12;
+  doc.setFontSize(12);
+  doc.text("Candidates", 14, y);
+  y += 8;
+  doc.setFontSize(9);
+  candidates.forEach((candidate) => {
+    if (y > 280) {
+      doc.addPage();
+      y = 16;
+    }
+    const skills = candidate.skills || candidate.technical_skills || "Not provided";
+    doc.text(
+      `${candidate.name} | ${candidate.email || "No email"} | ${candidate.job_title || "Open role"} | ${Number(candidate.score || 0)}% | ${candidate.status} | ${skills}`,
+      14,
+      y,
+      { maxWidth: 182 }
+    );
+    y += 12;
   });
 
   doc.save("talentlens-report.pdf");
@@ -696,7 +721,7 @@ function CandidatesPage({
       job_title: candidate.job_title || "",
       status: candidate.status,
       score: String(candidate.score || 0),
-      skills: candidate.skills || "",
+      skills: candidate.skills || candidate.technical_skills || "",
     });
     setShowForm(true);
   };
@@ -1250,7 +1275,13 @@ function AlertsPage({ alerts }: { alerts: AlertItem[] }) {
   );
 }
 
-function ReportsPage({ reportData }: { reportData: { cards: Array<{ label: string; value: string; delta: string }> } | null }) {
+function ReportsPage({
+  reportData,
+  candidates,
+}: {
+  reportData: { cards: Array<{ label: string; value: string; delta: string }> } | null;
+  candidates: Candidate[];
+}) {
   const cards = reportData?.cards || [];
   return (
     <div className="space-y-6">
@@ -1281,7 +1312,7 @@ function ReportsPage({ reportData }: { reportData: { cards: Array<{ label: strin
           </button>
           <button
             className="inline-flex items-center gap-2 rounded-xl bg-[#111827] px-3.5 py-2.5 text-sm font-medium text-white"
-            onClick={() => exportReportPdf(reportData?.cards || [])}
+            onClick={() => exportReportPdf(reportData?.cards || [], candidates)}
           >
             <Download className="h-4 w-4" />
             PDF
@@ -1301,18 +1332,48 @@ function ReportsPage({ reportData }: { reportData: { cards: Array<{ label: strin
         ))}
       </div>
 
-      <div className="rounded-2xl border border-[#eaedf2] bg-white p-4 shadow-[0_1px_0_rgba(15,23,42,0.02)]">
-        <div className="mb-4 text-lg font-semibold text-[#111827]">Hiring velocity</div>
-        <div className="flex h-48 items-end gap-3">
-          {(reportData ? reportData.cards.map((card) => Number.parseInt(card.value, 10) || 0) : []).map((value, index) => (
-            <div key={`${value}-${index}`} className="flex flex-1 flex-col items-center gap-2">
-              <div
-                className="flex h-full w-full items-end justify-center rounded-t-2xl bg-gradient-to-t from-[#6a5ce7] to-[#7d6ff1]"
-                style={{ height: `${value}%` }}
-              />
-              <span className="text-[10px] text-[#7a8598]">{["M", "T", "W", "T", "F", "S", "S"][index]}</span>
-            </div>
-          ))}
+      <div className="overflow-hidden rounded-2xl border border-[#eaedf2] bg-white shadow-[0_1px_0_rgba(15,23,42,0.02)]">
+        <div className="border-b border-[#edf1f5] px-5 py-4">
+          <h3 className="font-semibold text-[#111827]">Candidate Report</h3>
+          <p className="mt-1 text-sm text-[#7a8598]">{candidates.length} candidates</p>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="min-w-full text-left text-sm">
+            <thead className="bg-[#f8f9fc] text-[#7a8598]">
+              <tr>
+                <th className="px-5 py-3 font-medium">Candidate</th>
+                <th className="px-5 py-3 font-medium">Role</th>
+                <th className="px-5 py-3 font-medium">Skills</th>
+                <th className="px-5 py-3 font-medium">Status</th>
+                <th className="px-5 py-3 font-medium">Match</th>
+                <th className="px-5 py-3 font-medium">Added</th>
+              </tr>
+            </thead>
+            <tbody>
+              {candidates.map((candidate) => (
+                <tr key={candidate.id} className="border-t border-[#eef1f5]">
+                  <td className="px-5 py-4">
+                    <div className="font-medium text-[#1d2430]">{candidate.name}</div>
+                    <div className="mt-0.5 text-xs text-[#7a8598]">{candidate.email || "No email"}</div>
+                  </td>
+                  <td className="px-5 py-4 text-[#5f6d82]">{candidate.job_title || "Open role"}</td>
+                  <td className="max-w-xs px-5 py-4 text-[#5f6d82]">{candidate.skills || candidate.technical_skills || "Not provided"}</td>
+                  <td className="px-5 py-4"><StatusBadge value={candidate.status} /></td>
+                  <td className="px-5 py-4">
+                    <span className="inline-flex min-w-14 justify-center rounded-full bg-[#eafaf3] px-2.5 py-1 font-semibold text-[#1f8d68]">
+                      {Number(candidate.score || 0)}%
+                    </span>
+                  </td>
+                  <td className="px-5 py-4 text-[#7a8598]">
+                    {candidate.created_at ? new Date(candidate.created_at).toLocaleDateString() : "—"}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {!candidates.length && (
+            <div className="px-5 py-10 text-center text-sm text-[#7a8598]">No candidates available.</div>
+          )}
         </div>
       </div>
     </div>
@@ -1337,6 +1398,10 @@ function SettingsPage() {
   }, []);
 
   const saveProfile = async () => {
+    if (!profile.name.trim()) {
+      setMessage("Name is required");
+      return;
+    }
     try {
       const data = await apiRequest("/api/settings/profile", { method: "PUT", body: JSON.stringify(profile) });
       setProfile((previous) => ({ ...previous, ...data.profile }));
@@ -1367,6 +1432,18 @@ function SettingsPage() {
   };
 
   const changePassword = async () => {
+    if (!passwords.currentPassword) {
+      setMessage("Enter your current password");
+      return;
+    }
+    if (passwords.newPassword.length < 8) {
+      setMessage("New password must be at least 8 characters");
+      return;
+    }
+    if (passwords.newPassword !== passwords.confirmPassword) {
+      setMessage("Password confirmation does not match");
+      return;
+    }
     try {
       await apiRequest("/api/settings/password", { method: "PUT", body: JSON.stringify(passwords) });
       setPasswords({ currentPassword: "", newPassword: "", confirmPassword: "" });
@@ -1385,20 +1462,16 @@ function SettingsPage() {
       {message && <div className="rounded-xl border border-[#edf1f5] bg-white px-4 py-3 text-sm text-[#5f6d82]">{message}</div>}
       <div className="grid gap-6 lg:grid-cols-2">
         <div className="rounded-2xl border border-[#eaedf2] bg-white p-5">
-          <h3 className="mb-4 font-semibold text-[#111827]">Profile</h3>
+          <h3 className="mb-4 font-semibold text-[#111827]">Your name</h3>
           <div className="grid gap-3">
-            {([
-              ["name", "Name"],
-              ["username", "Username"],
-              ["displayName", "Display name"],
-              ["phone", "Phone"],
-              ["profilePicture", "Profile picture URL"],
-            ] as const).map(([key, label]) => (
-              <label key={key} className="text-sm text-[#5f6d82]">
-                {label}
-                <input value={profile[key]} onChange={(e) => setProfile((prev) => ({ ...prev, [key]: e.target.value }))} className="mt-1 w-full rounded-xl border border-[#e9edf3] bg-[#f8f9fc] px-3 py-2.5" />
-              </label>
-            ))}
+            <label className="text-sm text-[#5f6d82]">
+              Name
+              <input
+                value={profile.name}
+                onChange={(e) => setProfile((prev) => ({ ...prev, name: e.target.value, displayName: e.target.value }))}
+                className="mt-1 w-full rounded-xl border border-[#e9edf3] bg-[#f8f9fc] px-3 py-2.5"
+              />
+            </label>
             <button onClick={saveProfile} className="mt-2 rounded-xl bg-[#111827] px-4 py-2.5 text-sm text-white">Save profile</button>
             <label className="text-sm text-[#5f6d82]">Email
               <input value={profile.email} onChange={(e) => setProfile((prev) => ({ ...prev, email: e.target.value }))} className="mt-1 w-full rounded-xl border border-[#e9edf3] bg-[#f8f9fc] px-3 py-2.5" />
@@ -1859,7 +1932,7 @@ export default function App() {
       case "Alerts":
         return <AlertsPage alerts={alerts} />;
       case "Reports":
-        return <ReportsPage reportData={reportData} />;
+        return <ReportsPage reportData={reportData} candidates={candidates} />;
       case "History":
         return <HistoryPage analyses={analyses} onDelete={handleDeleteAnalysis} />;
       case "Settings":
